@@ -35,6 +35,8 @@ func run(args []string) error {
 		return cmdDelete(rest)
 	case "sync":
 		return cmdSync(rest)
+	case "dash", "dashboard":
+		return cmdDash(rest)
 	case "mcp":
 		return cmdMCP(rest)
 	case "call":
@@ -61,7 +63,8 @@ func usage(w *os.File) {
 	fmt.Fprint(w, `drover -- kubectl, but for context
 
 Usage:
-  drover serve                      run the engine
+  drover serve                      run the engine (draws a dashboard on a tty)
+  drover dash                       open the dashboard for a running engine
   drover apply -f <file|dir>        apply objects (-f - reads stdin)
   drover get <kind> [name]          list or show objects
   drover delete <kind> <name>       remove an object and its checkout

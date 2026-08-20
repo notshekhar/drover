@@ -50,6 +50,44 @@ Start the engine:
 drover serve
 ```
 
+That draws a dashboard — what it holds, when each repository last synced, which
+requests and databases an agent is actually offered:
+
+```
+ drover 0.2.0
+────────────────────────────────────────────────────────────────────────────
+ engine  http://127.0.0.1:7432   MCP  http://127.0.0.1:7432/mcp
+ data    /Users/you/.drover   uptime  2h0m
+
+ REPOSITORIES (3) ──────────────────────────────────────────────────────────
+   NAME             BRANCH    STATUS     COMMIT    REFRESH   LAST SYNC
+   api              main      ready      b045e541  15m       3m ago
+   vendored-docs    main      ready      99aa88bb  never     1d ago
+   private-thing    main      failed     -         1h        never
+      clone https://github.com/acme/private: remote: Repository not found.
+
+ HTTP REQUESTS (2) ─────────────────────────────────────────────────────────
+   NAME               METHOD  ENVIRONMENT  URL
+ ● get-user           GET     prod         {{baseUrl}}/v1/users/{userId}
+ ○ create-issue       POST    prod         {{baseUrl}}/issues
+
+ SQL CONNECTIONS (1) ───────────────────────────────────────────────────────
+   NAME               PROVIDER   ACCESS          STATUS
+ ● analytics          postgres   read-only       ready
+────────────────────────────────────────────────────────────────────────────
+ r reload configs   s sync repos   q quit
+```
+
+`●` means an agent is offered it; `○` means it is stored but never advertised
+— a non-GET request, or a database whose health check has not passed.
+
+Press **r** after editing a yaml file and the engine re-reads and applies it,
+no restart. **s** refreshes every repository now.
+
+`drover dash` opens the same screen for an engine that is already running,
+including one on another machine (`--server`). `drover serve --no-tui` logs
+plainly instead, which is what you want under systemd or in CI.
+
 Tell it about a repository:
 
 ```yaml
@@ -249,7 +287,8 @@ applied from and the engine still holds what you gave it.
 ## Commands
 
 ```
-drover serve                       run the engine
+drover serve                       run the engine (dashboard on a tty)
+drover dash                        open the dashboard for a running engine
 drover apply -f <file|dir>         apply objects (-f - reads stdin)
 drover get <kind> [name]           list or show objects
 drover delete <kind> <name>        remove an object and its checkout

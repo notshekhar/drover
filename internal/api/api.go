@@ -210,6 +210,65 @@ type FindResponse struct {
 	Truncated bool     `json:"truncated,omitempty"`
 }
 
+// ReloadResponse reports what a reload did.
+type ReloadResponse struct {
+	Message string `json:"message"`
+}
+
+// DashboardResponse is everything the dashboard draws, in one round trip.
+//
+// It is its own endpoint rather than four list calls because the dashboard
+// repaints on a timer, and four requests a second against a remote engine is
+// wasteful when one will do.
+type DashboardResponse struct {
+	Version   string        `json:"version"`
+	DataDir   string        `json:"dataDir"`
+	Listen    string        `json:"listen"`
+	UptimeSec int64         `json:"uptimeSec"`
+	Repos     []DashRepo    `json:"repos"`
+	Requests  []DashRequest `json:"requests"`
+	SQLs      []DashSQL     `json:"sqls"`
+	Envs      []DashEnv     `json:"envs"`
+}
+
+// DashRepo is one repository row.
+type DashRepo struct {
+	Name     string `json:"name"`
+	URL      string `json:"url"`
+	Branch   string `json:"branch"`
+	Refresh  string `json:"refresh"`
+	Status   string `json:"status"`
+	Commit   string `json:"commit,omitempty"`
+	LastSync string `json:"lastSync,omitempty"`
+	Error    string `json:"error,omitempty"`
+}
+
+// DashRequest is one HTTPRequest row.
+type DashRequest struct {
+	Name        string `json:"name"`
+	Method      string `json:"method"`
+	URL         string `json:"url"`
+	Environment string `json:"environment"`
+	Offered     bool   `json:"offered"`
+}
+
+// DashSQL is one SQLConnection row.
+type DashSQL struct {
+	Name     string `json:"name"`
+	Provider string `json:"provider"`
+	ReadOnly bool   `json:"readOnly"`
+	Status   string `json:"status"`
+	Error    string `json:"error,omitempty"`
+}
+
+// DashEnv is one Environment row.
+type DashEnv struct {
+	Name      string `json:"name"`
+	Variables int    `json:"variables"`
+	Secrets   int    `json:"secrets"`
+	Unset     int    `json:"unset"`
+}
+
 // StatusResponse answers "is the engine up and what is it holding".
 type StatusResponse struct {
 	Version string `json:"version"`

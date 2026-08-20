@@ -180,6 +180,24 @@ func (c *Client) Health(name string) error {
 	return c.do(http.MethodPost, api.Prefix+"/sqlconnections/"+name+"/health", []byte("{}"), nil, nil)
 }
 
+// Dashboard fetches everything the dashboard draws, in one round trip.
+func (c *Client) Dashboard() (*api.DashboardResponse, error) {
+	var out api.DashboardResponse
+	if err := c.do(http.MethodGet, api.Prefix+"/dashboard", nil, nil, &out); err != nil {
+		return nil, err
+	}
+	return &out, nil
+}
+
+// Reload asks the engine to re-read its config and apply it.
+func (c *Client) Reload() (string, error) {
+	var out api.ReloadResponse
+	if err := c.do(http.MethodPost, api.Prefix+"/reload", []byte("{}"), nil, &out); err != nil {
+		return "", err
+	}
+	return out.Message, nil
+}
+
 // --- file tools ---
 
 // Ls lists a directory in the checkouts.

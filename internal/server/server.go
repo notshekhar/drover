@@ -44,6 +44,10 @@ type Options struct {
 	// NoSync builds a server that never shells out to git. Tests that only
 	// care about the object API use it so they do not need a network.
 	NoSync bool
+
+	// ConfigPath is the file a reload re-reads. Empty means reload is refused,
+	// since there would be nothing to re-read.
+	ConfigPath string
 }
 
 // Server is the engine.
@@ -56,6 +60,8 @@ type Server struct {
 	sql   *sqldb.Pool
 	files *files.Root
 	mux   *http.ServeMux
+
+	started time.Time
 }
 
 // New builds a server over the data directory.
@@ -74,6 +80,8 @@ func New(opts Options) (*Server, error) {
 		http:  httpreq.New(),
 		sql:   sqldb.NewPool(),
 		files: files.New(opts.DataDir),
+
+		started: time.Now(),
 	}
 	if !opts.NoSync {
 		s.sync = sync.New(sync.Options{
@@ -115,6 +123,8 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("GET "+api.Prefix+"/status", s.handleStatus)
 	s.mux.HandleFunc("POST "+api.Prefix+"/repositories/{name}/sync", s.handleSyncOne)
 	s.mux.HandleFunc("POST "+api.Prefix+"/sync", s.handleSyncAll)
+	s.mux.HandleFunc("GET "+api.Prefix+"/dashboard", s.handleDashboard)
+	s.mux.HandleFunc("POST "+api.Prefix+"/reload", s.handleReload)
 	s.mux.HandleFunc("POST "+api.Prefix+"/files/ls", s.handleLs)
 	s.mux.HandleFunc("POST "+api.Prefix+"/files/read", s.handleRead)
 	s.mux.HandleFunc("POST "+api.Prefix+"/files/grep", s.handleGrep)
@@ -151,19 +161,9 @@ func (s *Server) Bootstrap(cfg *config.Config) error {
 		return fmt.Errorf("apply: %w (fix the path, or drop it with `drover forget <path>`)", err)
 	}
 
-	batch := object.NewBatch()
-	for _, f := range files {
-		data, err := os.ReadFile(f)
-		if err != nil {
-			return fmt.Errorf("apply: %w", err)
-		}
-		objs, err := object.Parse(f, data)
-		if err != nil {
-			return fmt.Errorf("apply: %w", err)
-		}
-		if err := batch.AddAll(objs); err != nil {
-			return fmt.Errorf("apply: %w", err)
-		}
+	batch, err := s.readBatch(files)
+	if err != nil {
+		return fmt.Errorf("apply: %w", err)
 	}
 	if err := batch.Check(s.storedRefs()); err != nil {
 		return fmt.Errorf("apply: %w", err)
@@ -234,6 +234,26 @@ func (s *Server) CheckSQLHealth(ctx context.Context) {
 		}
 		s.logf("sqlconnection %s: healthy", name)
 	}
+}
+
+// readBatch parses every file into one batch. Bootstrap and the dashboard's
+// reload share it, so a reload validates exactly as a startup apply does.
+func (s *Server) readBatch(files []string) (*object.Batch, error) {
+	batch := object.NewBatch()
+	for _, f := range files {
+		data, err := os.ReadFile(f)
+		if err != nil {
+			return nil, err
+		}
+		objs, err := object.Parse(f, data)
+		if err != nil {
+			return nil, err
+		}
+		if err := batch.AddAll(objs); err != nil {
+			return nil, err
+		}
+	}
+	return batch, nil
 }
 
 // storedRefs is what the store already holds, so a batch may reference an
@@ -495,6 +515,25 @@ func (s *Server) handleSyncAll(w http.ResponseWriter, r *http.Request) {
 	}
 	s.sync.SyncAll()
 	w.WriteHeader(http.StatusAccepted)
+}
+
+func (s *Server) handleDashboard(w http.ResponseWriter, r *http.Request) {
+	writeJSON(w, http.StatusOK, s.DashboardState(s.opts.Listen, s.started))
+}
+
+// handleReload re-reads the config and applies it, for `drover dash` and for
+// anyone who would rather curl it than press a key.
+func (s *Server) handleReload(w http.ResponseWriter, r *http.Request) {
+	if s.opts.ConfigPath == "" {
+		writeErr(w, http.StatusBadRequest, errors.New("this engine was started without a config file"))
+		return
+	}
+	msg, _, err := s.Reload(s.opts.ConfigPath)
+	if err != nil {
+		writeErr(w, http.StatusBadRequest, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, api.ReloadResponse{Message: msg})
 }
 
 // --- file tools ---

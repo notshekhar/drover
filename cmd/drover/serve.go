@@ -5,6 +5,7 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"io"
 	"net"
 	"os"
 	"os/signal"
@@ -12,6 +13,7 @@ import (
 
 	"github.com/notshekhar/drover/internal/config"
 	"github.com/notshekhar/drover/internal/server"
+	"github.com/notshekhar/drover/internal/tui"
 )
 
 func cmdServe(args []string) error {
@@ -22,6 +24,7 @@ func cmdServe(args []string) error {
 		configFlag  = fs.String("config", "", "config file (default <data-dir>/config.yaml)")
 		listenFlag  = fs.String("listen", "", "address to bind (default from config, else "+config.DefaultListen+")")
 		syncFlag    = fs.String("sync", "", "default refresh interval for repositories that do not set one (e.g. 30m, never)")
+		noTUIFlag   = fs.Bool("no-tui", false, "log plainly instead of drawing the dashboard")
 	)
 	if err := fs.Parse(args); err != nil {
 		return err
@@ -53,12 +56,24 @@ func cmdServe(args []string) error {
 		listen = *listenFlag
 	}
 
+	// The dashboard needs a terminal on both ends. Without one -- under
+	// systemd, in a pipe, in CI -- the log lines are the only interface there
+	// is, so they stay.
+	dashboard := !*noTUIFlag && tui.Supported(os.Stdin, os.Stderr)
+
+	// With the dashboard up, a stray log line would scribble over the drawing.
+	var engineLog io.Writer = os.Stderr
+	if dashboard {
+		engineLog = io.Discard
+	}
+
 	srv, err := server.New(server.Options{
-		DataDir: dataDir,
-		Listen:  listen,
-		Version: Version,
-		Log:     os.Stderr,
-		Sync:    cfg.SyncInterval(),
+		DataDir:    dataDir,
+		Listen:     listen,
+		Version:    Version,
+		Log:        engineLog,
+		Sync:       cfg.SyncInterval(),
+		ConfigPath: cfgPath,
 	})
 	if err != nil {
 		return err
@@ -81,8 +96,9 @@ func cmdServe(args []string) error {
 	defer srv.StopSync()
 
 	// The health gate decides whether a sql tool is offered at all, so it runs
-	// at startup rather than at the first query.
-	srv.CheckSQLHealth(ctx)
+	// at startup rather than at the first query. In the background, because a
+	// database that is down should not hold the listener shut.
+	go srv.CheckSQLHealth(ctx)
 
 	ln, err := srv.Listen()
 	if err != nil {
@@ -92,14 +108,49 @@ func cmdServe(args []string) error {
 		<-ctx.Done()
 		ln.Close()
 	}()
-	fmt.Fprintf(os.Stderr, "drover %s listening on http://%s (data %s, sync %s)\n",
-		Version, ln.Addr(), dataDir, cfg.SyncInterval())
-	fmt.Fprintf(os.Stderr, "  MCP: http://%s%s\n", ln.Addr(), server.MCPPath)
-	fmt.Fprintf(os.Stderr, "  add it with: claude mcp add --transport http drover http://%s%s\n", ln.Addr(), server.MCPPath)
 
-	if err := srv.Serve(ln); err != nil && !errors.Is(err, net.ErrClosed) {
+	serveErr := make(chan error, 1)
+	go func() {
+		err := srv.Serve(ln)
+		if err != nil && errors.Is(err, net.ErrClosed) {
+			err = nil
+		}
+		serveErr <- err
+	}()
+
+	if !dashboard {
+		fmt.Fprintf(os.Stderr, "drover %s listening on http://%s (data %s, sync %s)\n",
+			Version, ln.Addr(), dataDir, cfg.SyncInterval())
+		fmt.Fprintf(os.Stderr, "  MCP: http://%s%s\n", ln.Addr(), server.MCPPath)
+		fmt.Fprintf(os.Stderr, "  add it with: claude mcp add --transport http drover http://%s%s\n",
+			ln.Addr(), server.MCPPath)
+		err := <-serveErr
+		fmt.Fprintln(os.Stderr, "drover stopped")
 		return err
 	}
-	fmt.Fprintln(os.Stderr, "drover stopped")
+
+	// Quitting the dashboard stops the engine: it is the foreground process
+	// the user started, so closing it should not leave a daemon behind.
+	uiCtx, cancelUI := context.WithCancel(ctx)
+	defer cancelUI()
+	go func() {
+		<-serveErr
+		cancelUI()
+	}()
+
+	runner := &tui.Runner{
+		Source: srv.NewDashboard(cfg, ln.Addr().String()),
+		In:     os.Stdin,
+		Out:    os.Stderr,
+	}
+	if err := runner.Run(uiCtx); err != nil {
+		// The screen could not be set up (no raw mode, say). That is cosmetic,
+		// so fall back to serving rather than refusing to run at all.
+		fmt.Fprintf(os.Stderr, "dashboard unavailable (%v); serving on http://%s\n", err, ln.Addr())
+		return <-serveErr
+	}
+
+	ln.Close()
+	<-serveErr
 	return nil
 }
