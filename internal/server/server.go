@@ -24,7 +24,9 @@ import (
 	"github.com/notshekhar/drover/internal/config"
 	"github.com/notshekhar/drover/internal/docs"
 	"github.com/notshekhar/drover/internal/files"
+	"github.com/notshekhar/drover/internal/git"
 	"github.com/notshekhar/drover/internal/httpreq"
+	"github.com/notshekhar/drover/internal/lsp"
 	"github.com/notshekhar/drover/internal/mcp"
 	"github.com/notshekhar/drover/internal/object"
 	"github.com/notshekhar/drover/internal/repo"
@@ -51,6 +53,18 @@ type Options struct {
 	// ConfigPath is the file a reload re-reads. Empty means reload is refused,
 	// since there would be nothing to re-read.
 	ConfigPath string
+
+	// ServersDir is where language servers are installed. Empty means
+	// ~/.drover/servers.
+	ServersDir string
+
+	// NoServerInstall leaves drover to whatever language servers are already
+	// on the machine, rather than fetching one on first use.
+	//
+	// The tool is offered either way. This gates the network, not the feature:
+	// downloading 50MB the first time somebody asks about a Java file is the
+	// surprising part, not the asking.
+	NoServerInstall bool
 }
 
 // Server is the engine.
@@ -62,6 +76,8 @@ type Server struct {
 	http  *httpreq.Executor
 	sql   *sqldb.Pool
 	files *files.Root
+	git   *git.Repos
+	lsp   *lsp.Manager
 	mux   *http.ServeMux
 
 	started time.Time
@@ -88,19 +104,46 @@ func New(opts Options) (*Server, error) {
 		http:  httpreq.New(),
 		sql:   sqldb.NewPool(),
 		files: files.New(opts.DataDir),
+		git:   git.New(opts.DataDir),
 
 		started: time.Now(),
 	}
+	// Language servers are wired up unconditionally, like the file tools they
+	// sit beside. Nothing is launched here: a server starts the first time
+	// somebody asks a question it can answer, and is reaped when nobody has
+	// asked for a while, so an engine nobody queries pays nothing for it.
+	serversDir := opts.ServersDir
+	if serversDir == "" {
+		serversDir = lsp.DefaultDir()
+	}
+	acquirer := lsp.NewAcquirer(serversDir)
+	acquirer.NoInstall = opts.NoServerInstall || os.Getenv("DROVER_NO_SERVER_INSTALL") != ""
+	s.lsp = lsp.NewManager(s.files, acquirer)
+	s.lsp.Start()
+
 	if !opts.NoSync {
 		s.sync = syncmgr.New(syncmgr.Options{
 			Store:   st,
 			Repo:    s.repo,
 			Default: opts.Sync,
 			Log:     opts.Log,
+			// Reconcile resets the working tree, so a server that has already
+			// parsed it is now answering about a tree that no longer exists.
+			OnCommitChanged: s.restartLanguageServers,
 		})
 	}
 	s.routes()
 	return s, nil
+}
+
+// restartLanguageServers drops the servers for a repository whose checkout
+// just moved. Safe to call when they are turned off.
+func (s *Server) restartLanguageServers(repository string) {
+	if s.lsp == nil {
+		return
+	}
+	s.logf("repository %s: restarting its language servers", repository)
+	s.lsp.Restart(repository)
 }
 
 // Store exposes the object store, for tests and for the CLI's local paths.
@@ -137,6 +180,8 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("POST "+api.Prefix+"/files/read", s.handleRead)
 	s.mux.HandleFunc("POST "+api.Prefix+"/files/grep", s.handleGrep)
 	s.mux.HandleFunc("POST "+api.Prefix+"/files/find", s.handleFind)
+	s.mux.HandleFunc("POST "+api.Prefix+"/git", s.handleGit)
+	s.mux.HandleFunc("POST "+api.Prefix+"/lsp", s.handleLSP)
 	s.mux.HandleFunc("POST "+api.Prefix+"/httprequests/{name}/call", s.handleCall)
 	s.mux.HandleFunc("POST "+api.Prefix+"/sqlconnections/{name}/query", s.handleQuery)
 	s.mux.HandleFunc("POST "+api.Prefix+"/sqlconnections/{name}/health", s.handleHealth)
@@ -216,6 +261,11 @@ func (s *Server) StopSync() {
 	}
 	if s.sql != nil {
 		s.sql.Close()
+	}
+	if s.lsp != nil {
+		// A language server that outlives the engine is a gigabyte of resident
+		// memory with nobody left to own it.
+		s.lsp.Close()
 	}
 }
 
@@ -721,6 +771,34 @@ func (s *Server) handleFind(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, api.FindResponse{Paths: res.Paths, Truncated: res.Truncated})
+}
+
+// handleGit answers one history question about a checkout.
+func (s *Server) handleGit(w http.ResponseWriter, r *http.Request) {
+	var req api.GitRequest
+	if !decodeBody(w, r, &req) {
+		return
+	}
+	res, err := s.gitQuery(r.Context(), req)
+	if err != nil {
+		writeErr(w, gitErrStatus(err), err)
+		return
+	}
+	writeJSON(w, http.StatusOK, res)
+}
+
+// handleLSP answers one navigation question.
+func (s *Server) handleLSP(w http.ResponseWriter, r *http.Request) {
+	var req api.LSPRequest
+	if !decodeBody(w, r, &req) {
+		return
+	}
+	res, err := s.lspQuery(r.Context(), req)
+	if err != nil {
+		writeErr(w, lspErrStatus(err), err)
+		return
+	}
+	writeJSON(w, http.StatusOK, res)
 }
 
 // handleCall executes one HTTPRequest.

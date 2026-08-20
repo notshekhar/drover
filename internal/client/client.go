@@ -236,6 +236,24 @@ func (c *Client) Find(req api.FindRequest) (*api.FindResponse, error) {
 	return &out, nil
 }
 
+// Git answers one history question about a checkout.
+func (c *Client) Git(req api.GitRequest) (*api.GitResponse, error) {
+	var out api.GitResponse
+	if err := c.post(api.Prefix+"/git", req, &out); err != nil {
+		return nil, err
+	}
+	return &out, nil
+}
+
+// LSP answers one navigation question.
+func (c *Client) LSP(req api.LSPRequest) (*api.LSPResponse, error) {
+	var out api.LSPResponse
+	if err := c.post(api.Prefix+"/lsp", req, &out); err != nil {
+		return nil, err
+	}
+	return &out, nil
+}
+
 // post marshals a body, sends it, and decodes the reply.
 func (c *Client) post(path string, body, out any) error {
 	data, err := json.Marshal(body)

@@ -114,6 +114,15 @@ func (r *Root) resolve(rel string) (string, error) {
 	return resolved, nil
 }
 
+// Resolve turns a repository-relative path into an absolute one that is
+// provably inside the checkouts. It is exported so the language-server layer
+// jails paths through exactly this code rather than through a second copy of
+// it that could drift.
+func (r *Root) Resolve(rel string) (string, error) { return r.resolve(rel) }
+
+// Display turns an absolute path back into the repo-relative form callers use.
+func (r *Root) Display(abs string) string { return r.display(abs) }
+
 // resolveDir resolves a search scope and insists it exists. Returning an
 // empty result for a path that is not there reads as "no matches", which is a
 // different and much more misleading answer than "no such directory".

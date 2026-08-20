@@ -449,7 +449,7 @@ func TestToolCountDoesNotGrowWithObjects(t *testing.T) {
 	for _, x := range tools {
 		names = append(names, x.(map[string]any)["name"].(string))
 	}
-	want := []string{"ls", "read", "grep", "find", "api_list", "api_describe", "api_call"}
+	want := []string{"ls", "read", "grep", "find", "git", "lsp", "api_list", "api_describe", "api_call"}
 	if len(names) != len(want) {
 		t.Fatalf("12 requests produced %d tools (%v); the set must stay fixed", len(names), names)
 	}

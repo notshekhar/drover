@@ -740,3 +740,35 @@ func TestShutdownReleasesTheListener(t *testing.T) {
 	}
 	again.Close()
 }
+
+// The lsp tool sits beside the file tools: always there, launching nothing
+// until a question is asked.
+func TestLSPServersOperation(t *testing.T) {
+	dir := t.TempDir()
+	srv, err := New(Options{DataDir: dir, NoSync: true, ServersDir: t.TempDir(), NoServerInstall: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(srv.StopSync)
+
+	req := httptest.NewRequest(http.MethodPost, api.Prefix+"/lsp",
+		strings.NewReader(`{"operation":"servers"}`))
+	rec := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d: %s", rec.Code, rec.Body.String())
+	}
+	var out api.LSPResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &out); err != nil {
+		t.Fatal(err)
+	}
+	if len(out.Servers) != 3 {
+		t.Fatalf("want all three languages accounted for, got %+v", out.Servers)
+	}
+	for _, s := range out.Servers {
+		if s.State == "" || s.Detail == "" {
+			t.Errorf("%s has no state or no explanation: %+v", s.Language, s)
+		}
+	}
+}

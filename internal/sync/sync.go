@@ -21,11 +21,12 @@ import (
 
 // Manager owns one worker per repository.
 type Manager struct {
-	store   *store.Store
-	rec     *repo.Reconciler
-	def     time.Duration
-	log     io.Writer
-	baseCtx context.Context
+	store    *store.Store
+	rec      *repo.Reconciler
+	onChange func(string)
+	def      time.Duration
+	log      io.Writer
+	baseCtx  context.Context
 
 	mu      sync.Mutex
 	workers map[string]*worker
@@ -52,6 +53,15 @@ type Options struct {
 	Repo    *repo.Reconciler
 	Default time.Duration // server-wide default for objects that set none
 	Log     io.Writer
+
+	// OnCommitChanged is called after a reconcile that moved the checkout to a
+	// different commit.
+	//
+	// It exists for the language servers: reconcile rewrites the working tree
+	// with `git reset --hard`, and a server that has already parsed the old
+	// tree will go on answering confidently and wrongly. Nothing else needs
+	// to know, so this is a callback rather than an event bus.
+	OnCommitChanged func(repository string)
 }
 
 // New builds a Manager.
@@ -60,11 +70,12 @@ func New(opts Options) *Manager {
 		opts.Log = io.Discard
 	}
 	return &Manager{
-		store:   opts.Store,
-		rec:     opts.Repo,
-		def:     opts.Default,
-		log:     opts.Log,
-		workers: map[string]*worker{},
+		store:    opts.Store,
+		rec:      opts.Repo,
+		def:      opts.Default,
+		log:      opts.Log,
+		onChange: opts.OnCommitChanged,
+		workers:  map[string]*worker{},
 	}
 }
 
@@ -264,6 +275,13 @@ func (m *Manager) reconcile(ctx context.Context, name string) {
 		return
 	}
 
+	// Remembered before the reset, so the callback below can tell a real
+	// change from a reconcile that found nothing new.
+	before := ""
+	if st, err := m.store.GetStatus(object.KindRepository, name); err == nil {
+		before = st.Commit
+	}
+
 	_ = m.store.MarkSyncing(object.KindRepository, name)
 	res, err := m.rec.Reconcile(ctx, name, spec)
 	if err != nil {
@@ -276,6 +294,9 @@ func (m *Manager) reconcile(ctx context.Context, name string) {
 	}
 
 	_ = m.store.MarkReady(object.KindRepository, name, res.Commit, res.Branch)
+	if m.onChange != nil && res.Commit != before {
+		m.onChange(name)
+	}
 	switch {
 	case res.Cloned:
 		m.logf("repository %s: cloned %s at %s", name, spec.Branch, short(res.Commit))

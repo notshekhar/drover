@@ -291,14 +291,35 @@ Tools an agent gets:
 | `read` | read a file, numbered lines, offset/limit windows |
 | `grep` | RE2 search, with `path` and `include` filters |
 | `find` | glob on the name, or on the whole path when it has a slash |
+| `git` | history: `log`, `show`, `diff`, `blame`, `search`, `file`, `branches`, `tags`, `contributors`, `status` |
+| `lsp` | code by meaning: `definition`, `references`, `hover`, `implementations`, `document_symbols`, `workspace_symbols`, `incoming_calls`, `outgoing_calls`, `diagnostics`, `servers` |
 | `api_list` | find a request by fuzzy search over everything it says; also lists the environments |
 | `api_describe` | one request's parameters in full |
 | `api_call` | perform a request |
 | `sql_query` | one read-only query against a named connection |
 
-**Eight tools, fixed.** Twenty requests do not become twenty tools — they
-become entries `api_list` returns, and the databases are listed inside
-`sql_query`'s own description, the way loop does it.
+**Ten tools, fixed.** Twenty requests do not become twenty tools — they
+become entries `api_list` returns, the databases are listed inside
+`sql_query`'s own description, and ten history operations sit behind `git`'s
+`operation` argument rather than becoming ten more tools.
+
+`grep` and `read` see the tree as it is now; `git` sees how it got that way —
+who changed a line, when a function first appeared, what a file looked like
+three releases ago. It shells out to git for reads only: nothing it can do
+writes to a checkout or reaches the network.
+
+`lsp` sees what the code *means*. `grep` finds a string; `lsp` finds the
+symbol — the one definition, every real use, the type, the callers — for
+TypeScript, Go and Java. Give it the identifier's text; it works out the
+column itself.
+
+Servers start the first time a question needs one, and are reaped when nobody
+has asked for a while, so an engine nobody queries pays nothing for them. They
+install themselves into `~/.drover/servers`: TypeScript 7 straight from the
+npm registry over HTTPS (a native binary — no Node, no npm), gopls with `go
+install`, jdtls from Eclipse. The `servers` operation reports which are ready
+and, for one that is not, exactly why. `DROVER_NO_SERVER_INSTALL=1` leaves
+drover to whatever is already on the machine.
 
 The file tools are jailed to the checkouts. `..` is rejected, symlinks are
 resolved and re-checked, and walks never follow a link out of the tree.

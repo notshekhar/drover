@@ -275,3 +275,208 @@ type StatusResponse struct {
 	DataDir string `json:"dataDir"`
 	Objects int    `json:"objects"`
 }
+
+// --- git tool ---
+
+// GitRequest is one history question. Which fields matter depends on
+// Operation; the engine says so plainly when a required one is missing.
+type GitRequest struct {
+	Operation  string `json:"operation"`
+	Repository string `json:"repository,omitempty"`
+	Path       string `json:"path,omitempty"`
+	Rev        string `json:"rev,omitempty"`
+	From       string `json:"from,omitempty"`
+	To         string `json:"to,omitempty"`
+	Author     string `json:"author,omitempty"`
+	Since      string `json:"since,omitempty"`
+	Until      string `json:"until,omitempty"`
+	Grep       string `json:"grep,omitempty"`
+	Query      string `json:"query,omitempty"`
+	Regex      bool   `json:"regex,omitempty"`
+	Merges     string `json:"merges,omitempty"`
+	Patch      bool   `json:"patch,omitempty"`
+	Lines      string `json:"lines,omitempty"`
+	Limit      int    `json:"limit,omitempty"`
+}
+
+// GitCommit is one commit's metadata.
+type GitCommit struct {
+	Hash       string   `json:"hash"`
+	Short      string   `json:"short"`
+	Author     string   `json:"author"`
+	Email      string   `json:"email,omitempty"`
+	Date       string   `json:"date"`
+	Committer  string   `json:"committer,omitempty"`
+	CommitDate string   `json:"commitDate,omitempty"`
+	Parents    []string `json:"parents,omitempty"`
+	Subject    string   `json:"subject"`
+	Body       string   `json:"body,omitempty"`
+	Files      int      `json:"files,omitempty"`
+	Insertions int      `json:"insertions,omitempty"`
+	Deletions  int      `json:"deletions,omitempty"`
+}
+
+// GitFileChange is one path a commit or a diff touched.
+type GitFileChange struct {
+	Status     string `json:"status"`
+	Path       string `json:"path"`
+	OldPath    string `json:"oldPath,omitempty"`
+	Insertions int    `json:"insertions,omitempty"`
+	Deletions  int    `json:"deletions,omitempty"`
+	Binary     bool   `json:"binary,omitempty"`
+}
+
+// GitBlameLine is one line with the commit that last touched it.
+type GitBlameLine struct {
+	Line    int    `json:"line"`
+	Hash    string `json:"hash"`
+	Short   string `json:"short"`
+	Author  string `json:"author"`
+	Date    string `json:"date"`
+	Summary string `json:"summary,omitempty"`
+	Text    string `json:"text"`
+}
+
+// GitRef is a branch or a tag.
+type GitRef struct {
+	Name    string `json:"name"`
+	Type    string `json:"type"`
+	Hash    string `json:"hash"`
+	Short   string `json:"short"`
+	Date    string `json:"date,omitempty"`
+	Subject string `json:"subject,omitempty"`
+	Head    bool   `json:"head,omitempty"`
+}
+
+// GitAuthor is one contributor's tally.
+type GitAuthor struct {
+	Name    string `json:"name"`
+	Email   string `json:"email"`
+	Commits int    `json:"commits"`
+	First   string `json:"first,omitempty"`
+	Last    string `json:"last,omitempty"`
+}
+
+// GitStatus is the state of one checkout.
+type GitStatus struct {
+	Repository string    `json:"repository"`
+	URL        string    `json:"url,omitempty"`
+	Branch     string    `json:"branch,omitempty"`
+	Head       GitCommit `json:"head"`
+	Commits    int       `json:"commits,omitempty"`
+	FirstDate  string    `json:"firstDate,omitempty"`
+	Clean      bool      `json:"clean"`
+	Dirty      []string  `json:"dirty,omitempty"`
+	LastFetch  string    `json:"lastFetch,omitempty"`
+}
+
+// GitResponse is a union: which fields are set depends on the operation.
+type GitResponse struct {
+	Operation  string `json:"operation"`
+	Repository string `json:"repository"`
+	Branch     string `json:"branch,omitempty"`
+	Range      string `json:"range,omitempty"`
+	Rev        string `json:"rev,omitempty"`
+	Path       string `json:"path,omitempty"`
+
+	Commits []GitCommit     `json:"commits,omitempty"`
+	Commit  *GitCommit      `json:"commit,omitempty"`
+	Files   []GitFileChange `json:"files,omitempty"`
+	Patch   string          `json:"patch,omitempty"`
+	Blame   []GitBlameLine  `json:"blame,omitempty"`
+	Refs    []GitRef        `json:"refs,omitempty"`
+	Authors []GitAuthor     `json:"authors,omitempty"`
+	Status  *GitStatus      `json:"status,omitempty"`
+	Content string          `json:"content,omitempty"`
+
+	Truncated bool   `json:"truncated,omitempty"`
+	Note      string `json:"note,omitempty"`
+}
+
+// --- lsp tool ---
+
+// LSPRequest is one navigation question.
+type LSPRequest struct {
+	Operation  string `json:"operation"`
+	Path       string `json:"path,omitempty"`
+	Line       int    `json:"line,omitempty"`
+	Character  int    `json:"character,omitempty"`
+	Symbol     string `json:"symbol,omitempty"`
+	Occurrence int    `json:"occurrence,omitempty"`
+	Query      string `json:"query,omitempty"`
+	Limit      int    `json:"limit,omitempty"`
+}
+
+// LSPRef is a place in the code.
+type LSPRef struct {
+	Path      string `json:"path"`
+	Line      int    `json:"line"`
+	Character int    `json:"character"`
+	Text      string `json:"text,omitempty"`
+}
+
+// LSPSymbol is one entry of an outline or a symbol search.
+type LSPSymbol struct {
+	Name      string `json:"name"`
+	Kind      string `json:"kind"`
+	Detail    string `json:"detail,omitempty"`
+	Path      string `json:"path"`
+	Line      int    `json:"line"`
+	Character int    `json:"character"`
+	Depth     int    `json:"depth,omitempty"`
+}
+
+// LSPProblem is one diagnostic.
+type LSPProblem struct {
+	Path      string `json:"path"`
+	Line      int    `json:"line"`
+	Character int    `json:"character"`
+	Severity  string `json:"severity"`
+	Source    string `json:"source,omitempty"`
+	Code      string `json:"code,omitempty"`
+	Message   string `json:"message"`
+}
+
+// LSPCall is one edge of a call graph.
+type LSPCall struct {
+	Name  string `json:"name"`
+	Kind  string `json:"kind"`
+	Path  string `json:"path"`
+	Line  int    `json:"line"`
+	Sites []int  `json:"sites,omitempty"`
+}
+
+// LSPServer is one language server, running or merely possible.
+type LSPServer struct {
+	Key       string `json:"key"`
+	Language  string `json:"language"`
+	State     string `json:"state"`
+	Repo      string `json:"repository,omitempty"`
+	Root      string `json:"root,omitempty"`
+	Bin       string `json:"bin,omitempty"`
+	Source    string `json:"source,omitempty"`
+	Version   string `json:"version,omitempty"`
+	UptimeSec int64  `json:"uptimeSec,omitempty"`
+	IdleSec   int64  `json:"idleSec,omitempty"`
+	Requests  int    `json:"requests,omitempty"`
+	Detail    string `json:"detail,omitempty"`
+}
+
+// LSPResponse is a union: which fields are set depends on the operation.
+type LSPResponse struct {
+	Operation string `json:"operation"`
+	Path      string `json:"path,omitempty"`
+	Language  string `json:"language,omitempty"`
+	Position  string `json:"position,omitempty"`
+
+	Refs     []LSPRef     `json:"refs,omitempty"`
+	Hover    string       `json:"hover,omitempty"`
+	Symbols  []LSPSymbol  `json:"symbols,omitempty"`
+	Problems []LSPProblem `json:"problems,omitempty"`
+	Calls    []LSPCall    `json:"calls,omitempty"`
+	Servers  []LSPServer  `json:"servers,omitempty"`
+
+	Truncated   bool   `json:"truncated,omitempty"`
+	Note        string `json:"note,omitempty"`
+	ServerState string `json:"serverState,omitempty"`
+}

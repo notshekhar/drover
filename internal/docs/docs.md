@@ -422,14 +422,37 @@ The agent then has:
 | `read` | read a file, with line numbers |
 | `grep` | regular-expression search across the checkouts |
 | `find` | find files by name or path pattern |
+| `git` | history: `log`, `show`, `diff`, `blame`, `search`, `file`, `branches`, `tags`, `contributors`, `status` |
+| `lsp` | code by meaning: `definition`, `references`, `hover`, `implementations`, `document_symbols`, `workspace_symbols`, `incoming_calls`, `outgoing_calls`, `diagnostics`, `servers` |
 | `api_list` | find a request, with a fuzzy search over everything a request says; also lists the environments |
 | `api_describe` | one request's parameters in full |
 | `api_call` | perform a request |
 | `sql_query` | a read-only query against a named connection |
 
-The tool set is **fixed at eight** however much you add. Twenty requests do
-not become twenty tools — they become entries `api_list` returns, and the
-databases are listed inside `sql_query`'s own description.
+The tool set is **fixed at ten** however much you add. Twenty requests do
+not become twenty tools — they become entries `api_list` returns, the
+databases are listed inside `sql_query`'s own description, and `git`'s ten
+operations are an `operation` argument rather than ten more tools.
+
+`git` answers the questions the file tools cannot. `grep` and `read` see the
+tree as it is now; `git` sees how it got that way. A good sequence for "why
+is this code like this" is `grep` to find the line, `git blame` on that file,
+then `git show` on the commit blame names.
+
+`lsp` answers the other half: what the code *means*. `grep` finds a string,
+`lsp` finds the symbol.
+
+A language server is only started when a question needs one, and is reaped
+once nobody has asked it anything for a while, so the tool costs nothing until
+it is used. Servers install themselves into `~/.drover/servers` — TypeScript 7
+from the npm registry (a native binary, so no Node is involved), gopls via `go
+install`, jdtls from Eclipse — and the `servers` operation reports which are
+ready and, for one that is not, exactly why. Set
+`DROVER_NO_SERVER_INSTALL=1` to leave drover to whatever is already on the
+machine.
+
+Positions take the identifier's text rather than a column: `{"operation":
+"references", "path": "api/internal/db.go", "symbol": "Connect"}`.
 
 Everything an agent can reach is read-only. There is no tool that writes a
 file, none that POSTs, and none that writes to a database.

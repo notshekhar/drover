@@ -35,6 +35,10 @@ func (s *Server) callTool(params json.RawMessage) (any, *rpcError) {
 		return s.toolGrep(req.Arguments), nil
 	case "find":
 		return s.toolFind(req.Arguments), nil
+	case "git":
+		return s.toolGit(req.Arguments), nil
+	case "lsp":
+		return s.toolLSP(req.Arguments), nil
 	}
 
 	switch req.Name {

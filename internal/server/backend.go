@@ -4,11 +4,14 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net/http"
 	"strings"
 
 	"github.com/notshekhar/drover/internal/api"
 	"github.com/notshekhar/drover/internal/files"
+	"github.com/notshekhar/drover/internal/git"
 	"github.com/notshekhar/drover/internal/httpreq"
+	"github.com/notshekhar/drover/internal/lsp"
 	"github.com/notshekhar/drover/internal/object"
 	"github.com/notshekhar/drover/internal/store"
 )
@@ -196,4 +199,205 @@ func isForbidden(err error) bool { return errors.Is(err, files.ErrOutsideRoot) }
 // is a 400 rather than a 500.
 func unsupportedMethod(err error) bool {
 	return err != nil && strings.Contains(err.Error(), "only executes GET")
+}
+
+// --- git ---
+
+func (b *backend) Git(req api.GitRequest) (*api.GitResponse, error) {
+	return b.s.gitQuery(context.Background(), req)
+}
+
+// gitQuery runs one history operation and converts the engine's result to the
+// wire shape. The REST endpoint and the MCP tool both come through here, so
+// neither can end up with an operation the other does not have.
+func (s *Server) gitQuery(ctx context.Context, req api.GitRequest) (*api.GitResponse, error) {
+	res, err := s.git.Run(ctx, git.Options{
+		Operation:  req.Operation,
+		Repository: req.Repository,
+		Path:       req.Path,
+		Rev:        req.Rev,
+		From:       req.From,
+		To:         req.To,
+		Author:     req.Author,
+		Since:      req.Since,
+		Until:      req.Until,
+		Grep:       req.Grep,
+		Query:      req.Query,
+		Regex:      req.Regex,
+		Merges:     req.Merges,
+		Patch:      req.Patch,
+		Lines:      req.Lines,
+		Limit:      req.Limit,
+	})
+	if err != nil {
+		return nil, err
+	}
+	return gitView(res), nil
+}
+
+func gitView(res *git.Result) *api.GitResponse {
+	out := &api.GitResponse{
+		Operation:  res.Operation,
+		Repository: res.Repository,
+		Branch:     res.Branch,
+		Range:      res.Range,
+		Rev:        res.Rev,
+		Path:       res.Path,
+		Patch:      res.Patch,
+		Content:    res.Content,
+		Truncated:  res.Truncated,
+		Note:       res.Note,
+	}
+	for _, c := range res.Commits {
+		out.Commits = append(out.Commits, gitCommitView(c))
+	}
+	if res.Commit != nil {
+		c := gitCommitView(*res.Commit)
+		out.Commit = &c
+	}
+	for _, f := range res.Files {
+		out.Files = append(out.Files, api.GitFileChange{
+			Status:     f.Status,
+			Path:       f.Path,
+			OldPath:    f.OldPath,
+			Insertions: f.Insertions,
+			Deletions:  f.Deletions,
+			Binary:     f.Binary,
+		})
+	}
+	for _, l := range res.Blame {
+		out.Blame = append(out.Blame, api.GitBlameLine{
+			Line: l.Line, Hash: l.Hash, Short: l.Short,
+			Author: l.Author, Date: l.Date, Summary: l.Summary, Text: l.Text,
+		})
+	}
+	for _, r := range res.Refs {
+		out.Refs = append(out.Refs, api.GitRef{
+			Name: r.Name, Type: r.Type, Hash: r.Hash, Short: r.Short,
+			Date: r.Date, Subject: r.Subject, Head: r.Head,
+		})
+	}
+	for _, a := range res.Authors {
+		out.Authors = append(out.Authors, api.GitAuthor{
+			Name: a.Name, Email: a.Email, Commits: a.Commits, First: a.First, Last: a.Last,
+		})
+	}
+	if res.Status != nil {
+		out.Status = &api.GitStatus{
+			Repository: res.Status.Repository,
+			URL:        res.Status.URL,
+			Branch:     res.Status.Branch,
+			Head:       gitCommitView(res.Status.Head),
+			Commits:    res.Status.Commits,
+			FirstDate:  res.Status.FirstDate,
+			Clean:      res.Status.Clean,
+			Dirty:      res.Status.Dirty,
+			LastFetch:  res.Status.LastFetch,
+		}
+	}
+	return out
+}
+
+func gitCommitView(c git.Commit) api.GitCommit {
+	return api.GitCommit{
+		Hash:       c.Hash,
+		Short:      c.Short,
+		Author:     c.Author,
+		Email:      c.Email,
+		Date:       c.Date,
+		Committer:  c.Committer,
+		CommitDate: c.CommitDate,
+		Parents:    c.Parents,
+		Subject:    c.Subject,
+		Body:       c.Body,
+		Files:      c.Files,
+		Insertions: c.Insertions,
+		Deletions:  c.Deletions,
+	}
+}
+
+// gitErrStatus separates "there is no such repository" from "that argument
+// makes no sense", so a REST caller does not have to read the message to know
+// which it was.
+func gitErrStatus(err error) int {
+	switch {
+	case errors.Is(err, git.ErrNoRepository):
+		return http.StatusNotFound
+	case strings.HasPrefix(err.Error(), "no checkout named"):
+		return http.StatusNotFound
+	default:
+		return http.StatusBadRequest
+	}
+}
+
+// --- lsp ---
+
+func (b *backend) LSP(req api.LSPRequest) (*api.LSPResponse, error) {
+	return b.s.lspQuery(context.Background(), req)
+}
+
+// lspQuery answers one navigation question.
+func (s *Server) lspQuery(ctx context.Context, req api.LSPRequest) (*api.LSPResponse, error) {
+	res, err := s.lsp.Run(ctx, lsp.Request{
+		Operation:  req.Operation,
+		Path:       req.Path,
+		Line:       req.Line,
+		Character:  req.Character,
+		Symbol:     req.Symbol,
+		Occurrence: req.Occurrence,
+		Query:      req.Query,
+		Limit:      req.Limit,
+	})
+	if err != nil {
+		return nil, err
+	}
+	return lspView(res), nil
+}
+
+func lspView(res *lsp.Result) *api.LSPResponse {
+	out := &api.LSPResponse{
+		Operation:   res.Operation,
+		Path:        res.Path,
+		Language:    res.Language,
+		Position:    res.Position,
+		Hover:       res.Hover,
+		Truncated:   res.Truncated,
+		Note:        res.Note,
+		ServerState: res.ServerState,
+	}
+	for _, r := range res.Refs {
+		out.Refs = append(out.Refs, api.LSPRef{Path: r.Path, Line: r.Line, Character: r.Character, Text: r.Text})
+	}
+	for _, s := range res.Symbols {
+		out.Symbols = append(out.Symbols, api.LSPSymbol{
+			Name: s.Name, Kind: s.Kind, Detail: s.Detail,
+			Path: s.Path, Line: s.Line, Character: s.Character, Depth: s.Depth,
+		})
+	}
+	for _, p := range res.Problems {
+		out.Problems = append(out.Problems, api.LSPProblem{
+			Path: p.Path, Line: p.Line, Character: p.Character,
+			Severity: p.Severity, Source: p.Source, Code: p.Code, Message: p.Message,
+		})
+	}
+	for _, c := range res.Calls {
+		out.Calls = append(out.Calls, api.LSPCall{Name: c.Name, Kind: c.Kind, Path: c.Path, Line: c.Line, Sites: c.Sites})
+	}
+	for _, s := range res.Servers {
+		out.Servers = append(out.Servers, api.LSPServer{
+			Key: s.Key, Language: s.Language, State: s.State, Repo: s.Repo, Root: s.Root,
+			Bin: s.Bin, Source: s.Source, Version: s.Version,
+			UptimeSec: int64(s.Uptime.Seconds()), IdleSec: int64(s.IdleFor.Seconds()),
+			Requests: s.Requests, Detail: s.Detail,
+		})
+	}
+	return out
+}
+
+// lspErrStatus maps a jail violation to 403, the way the file tools do.
+func lspErrStatus(err error) int {
+	if isForbidden(err) {
+		return http.StatusForbidden
+	}
+	return http.StatusBadRequest
 }

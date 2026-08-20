@@ -6,6 +6,8 @@ import (
 	"io"
 	"sort"
 	"strings"
+	"sync"
+	"time"
 
 	"github.com/notshekhar/drover/internal/api"
 	"github.com/notshekhar/drover/internal/object"
@@ -25,6 +27,9 @@ type Backend interface {
 	ReadFile(req api.ReadRequest) (*api.ReadResponse, error)
 	Grep(req api.GrepRequest) (*api.GrepResponse, error)
 	Find(req api.FindRequest) (*api.FindResponse, error)
+
+	Git(req api.GitRequest) (*api.GitResponse, error)
+	LSP(req api.LSPRequest) (*api.LSPResponse, error)
 
 	Call(name string, req api.CallRequest) (*api.CallResponse, error)
 	Query(name, query string) (*api.QueryResponse, error)
@@ -50,6 +55,13 @@ var supportedVersions = map[string]bool{
 type Server struct {
 	Backend Backend
 	Version string
+
+	// langCache holds what the lsp tool's description says about which
+	// languages can start here, so working it out does not happen on every
+	// tools/list.
+	langMu    sync.Mutex
+	langCache string
+	langAt    time.Time
 }
 
 // Tool is one advertised tool.
@@ -160,13 +172,17 @@ Use ls, read, grep and find to explore the repositories it holds. Paths are rela
 
 Prefer grep and find to locate code, then read the specific file. These are real files on disk, not a search index, so the results are exact.
 
+The git tool answers the other half of the question. grep and read see the tree as it is now; git sees how it got that way -- commits, diffs, blame, who wrote something and when, and what a file looked like at any revision. It is read-only and never touches the network.
+
+Prefer lsp over grep for anything about a symbol: it knows the difference between a definition and a mention of the same word in a comment. grep is still the right tool for a string, a config value or a language with no server.
+
 For APIs: api_list finds a configured HTTP request (it takes a fuzzy search and also lists the environments), api_describe shows one request's parameters, and api_call performs it. Only GET requests are available.
 
 For databases: sql_query runs one read-only statement against a named connection. The connections are listed in that tool's own description.`
 
 // --- tools/list ---
 
-// The tool set is FIXED at eight, whatever is applied.
+// The tool set is FIXED at ten, whatever is applied.
 //
 // One tool per object does not survive contact with a real collection: twenty
 // requests became twenty tools, every one of them re-sent on every tools/list
@@ -174,6 +190,8 @@ For databases: sql_query runs one read-only statement against a named connection
 // in a tool's arguments, not in the tool list.
 func (s *Server) listTools(json.RawMessage) (any, *rpcError) {
 	tools := append([]Tool(nil), fileTools...)
+	tools = append(tools, s.gitTools()...)
+	tools = append(tools, s.lspTools()...)
 	tools = append(tools, s.apiTools()...)
 	tools = append(tools, s.sqlTools()...)
 	return map[string]any{"tools": tools}, nil
