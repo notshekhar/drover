@@ -91,6 +91,9 @@ type Model struct {
 	Notice     string
 	NoticeKind string // "ok", "err", ""
 	Reloading  bool
+
+	// AutoReload says the engine watches its files, so no reload key is shown.
+	AutoReload bool
 }
 
 // Render paints the whole screen into a string.
@@ -123,20 +126,22 @@ func Render(m Model, width int) string {
 }
 
 func header(b *strings.Builder, m Model, width int) {
-	title := fmt.Sprintf(" drover %s ", m.Version)
-	fmt.Fprintf(b, "%s%s%s%s\n", bold, cyan, title, reset)
-	fmt.Fprintf(b, "%s%s%s\n", dim, strings.Repeat("─", width), reset)
-	fmt.Fprintf(b, " %sengine%s  http://%s   %sMCP%s  http://%s/mcp\n",
-		dim, reset, m.Listen, dim, reset, m.Listen)
-	fmt.Fprintf(b, " %sdata%s    %s   %suptime%s  %s\n",
-		dim, reset, m.DataDir, dim, reset, humanDuration(time.Since(m.Started)))
+	// One line: the name, the two addresses someone actually needs, and how
+	// long it has been up. The data directory goes underneath because it is
+	// long and nobody reads it twice.
+	fmt.Fprintf(b, "\n %s%sdrover%s %s%s%s   %shttp://%s%s   %smcp%s http://%s/mcp   %s%s%s\n",
+		bold, cyan, reset, dim, m.Version, reset,
+		dim, m.Listen, reset,
+		dim, reset, m.Listen,
+		dim, humanDuration(time.Since(m.Started)), reset)
+	fmt.Fprintf(b, " %s%s%s\n", dim, truncate(m.DataDir, width-2), reset)
 }
 
 func section(b *strings.Builder, label string, n int, width int) {
-	head := fmt.Sprintf(" %s%s%s %s(%d)%s ", bold, label, reset, dim, n, reset)
+	suffix := fmt.Sprintf(" %d ", n)
+	head := fmt.Sprintf(" %s%s%s%s%s%s", bold, label, reset, dim, suffix, reset)
 	// The visible length excludes the escape sequences.
-	visible := len(label) + len(fmt.Sprintf(" (%d) ", n)) + 1
-	rule := width - visible
+	rule := width - (1 + len(label) + len(suffix))
 	if rule < 0 {
 		rule = 0
 	}
@@ -150,15 +155,25 @@ func repoTable(b *strings.Builder, repos []Repo, width int) {
 		return
 	}
 
-	fmt.Fprintf(b, "   %s%-16s %-9s %-10s %-9s %-9s %s%s\n",
-		dim, "NAME", "BRANCH", "STATUS", "COMMIT", "REFRESH", "LAST SYNC", reset)
+	fmt.Fprintf(b, "   %s%-18s %-24s %-9s %-8s %-8s %s%s\n",
+		dim, "NAME", "SOURCE", "BRANCH", "COMMIT", "REFRESH", "SYNCED", reset)
 	for _, r := range repos {
-		fmt.Fprintf(b, "   %-16s %-9s %s%s%s %-9s %-9s %s\n",
-			truncate(r.Name, 16),
+		mark := green + "●" + reset
+		switch r.Status {
+		case "failed":
+			mark = red + "✗" + reset
+		case "syncing":
+			mark = yellow + "◐" + reset
+		case "pending", "":
+			mark = dim + "○" + reset
+		}
+		fmt.Fprintf(b, " %s %-18s %s%-24s%s %-9s %-8s %-8s %s\n",
+			mark,
+			truncate(r.Name, 18),
+			dim, truncate(shortRemote(r.URL), 24), reset,
 			truncate(r.Branch, 9),
-			statusColor(r.Status), pad(truncate(r.Status, 10), 10), reset,
 			shortCommit(r.Commit),
-			truncate(r.Refresh, 9),
+			truncate(r.Refresh, 8),
 			relativeTime(r.LastSync),
 		)
 		// A failure is the reason someone opened this screen, so it gets its
@@ -249,8 +264,13 @@ func footer(b *strings.Builder, m Model, width int) {
 		fmt.Fprintf(b, "%s\n", clearLine)
 	}
 
-	fmt.Fprintf(b, " %s%sr%s reload configs   %s%ss%s sync repos   %s%sq%s quit%s\n",
-		bold, magenta, reset, bold, magenta, reset, bold, magenta, reset, clearLine)
+	if m.AutoReload {
+		fmt.Fprintf(b, " %s%sd%s summary   %s%ss%s sync   %s%sq%s quit   %sedits apply automatically%s%s\n",
+			bold, magenta, reset, bold, magenta, reset, bold, magenta, reset, dim, reset, clearLine)
+		return
+	}
+	fmt.Fprintf(b, " %s%sd%s summary   %s%sr%s reload   %s%ss%s sync   %s%sq%s quit%s\n",
+		bold, magenta, reset, bold, magenta, reset, bold, magenta, reset, bold, magenta, reset, clearLine)
 }
 
 // --- helpers ---
@@ -315,6 +335,21 @@ func humanDuration(d time.Duration) string {
 
 // pad right-pads to n visible columns. Every cell that carries colour must go
 // through here rather than a %-Ns verb.
+// shortRemote drops the scheme and the .git suffix, because on this screen the
+// useful part of a clone url is the host and path, and the rest is noise that
+// pushes the columns that matter off the edge.
+func shortRemote(url string) string {
+	s := url
+	for _, prefix := range []string{"https://", "http://", "ssh://", "git://"} {
+		s = strings.TrimPrefix(s, prefix)
+	}
+	if at := strings.Index(s, "@"); at >= 0 && at < strings.IndexByte(s+"/", '/') {
+		s = s[at+1:]
+	}
+	s = strings.TrimSuffix(s, ".git")
+	return s
+}
+
 func pad(s string, n int) string {
 	if len(s) >= n {
 		return s

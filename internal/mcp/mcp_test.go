@@ -432,61 +432,131 @@ spec:
 `, method)
 }
 
-func TestHTTPRequestBecomesATool(t *testing.T) {
+// The tool set is fixed. Twenty requests must not become twenty tools.
+func TestToolCountDoesNotGrowWithObjects(t *testing.T) {
 	dir := dataDirWithRepo(t)
 	applyDoc(t, dir, envDoc)
-	applyDoc(t, dir, httpRequestDoc("GET"))
+	for i := 0; i < 12; i++ {
+		doc := strings.Replace(httpRequestDoc("GET"), "name: get-user", fmt.Sprintf("name: req-%d", i), 1)
+		applyDoc(t, dir, doc)
+	}
 
 	s := start(t, dir)
 	resp := s.call("tools/list", nil)
 	tools := resp["result"].(map[string]any)["tools"].([]any)
 
-	var tool map[string]any
+	var names []string
 	for _, x := range tools {
-		m := x.(map[string]any)
-		if m["name"] == "call_get_user" {
-			tool = m
+		names = append(names, x.(map[string]any)["name"].(string))
+	}
+	want := []string{"ls", "read", "grep", "find", "api_list", "api_describe", "api_call"}
+	if len(names) != len(want) {
+		t.Fatalf("12 requests produced %d tools (%v); the set must stay fixed", len(names), names)
+	}
+	for _, w := range want {
+		if !slicesContains(names, w) {
+			t.Errorf("tool %q is missing from %v", w, names)
 		}
 	}
-	if tool == nil {
-		t.Fatal("the GET request was not advertised as a tool")
-	}
-
-	// The description a person wrote must reach the model.
-	desc := tool["description"].(string)
-	if !strings.Contains(desc, "Fetch one user by id") {
-		t.Errorf("description = %q, want the document's own words", desc)
-	}
-
-	schema := tool["inputSchema"].(map[string]any)
-	props := schema["properties"].(map[string]any)
-	userID, ok := props["userId"].(map[string]any)
-	if !ok {
-		t.Fatalf("properties = %v, want userId", props)
-	}
-	// The parameter description drover insists on at apply is the whole reason
-	// the tool is usable, so it must be carried through.
-	if !strings.Contains(userID["description"].(string), "opaque id") {
-		t.Errorf("userId description = %v", userID["description"])
-	}
-	required := schema["required"].([]any)
-	if len(required) != 1 || required[0] != "userId" {
-		t.Errorf("required = %v", required)
+	for _, n := range names {
+		if strings.HasPrefix(n, "call_") || strings.HasPrefix(n, "query_") {
+			t.Errorf("a per-object tool survived: %q", n)
+		}
 	}
 }
 
-// A non-GET request is stored but must never be handed to an agent.
-func TestNonGetRequestIsNotAdvertised(t *testing.T) {
+func slicesContains(haystack []string, needle string) bool {
+	for _, h := range haystack {
+		if h == needle {
+			return true
+		}
+	}
+	return false
+}
+
+// api_list is how a model discovers what it can call, so it must show the
+// request AND the environments, and its fuzzy search must actually filter.
+func TestAPIListAndSearch(t *testing.T) {
+	dir := dataDirWithRepo(t)
+	applyDoc(t, dir, envDoc)
+	applyDoc(t, dir, httpRequestDoc("GET"))
+	applyDoc(t, dir, strings.Replace(
+		strings.Replace(httpRequestDoc("GET"), "name: get-user", "name: list-orders", 1),
+		"Fetch one user by id.", "List the orders on an account.", 1))
+
+	s := start(t, dir)
+
+	out, isErr := s.callTool("api_list", nil)
+	if isErr {
+		t.Fatalf("api_list failed: %s", out)
+	}
+	// An index: names, summaries, parameter names and environments. The
+	// parameter *descriptions* belong to api_describe.
+	for _, want := range []string{"get-user", "list-orders", "Fetch one user by id", "userId", "environment", "prod"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("api_list output is missing %q:\n%s", want, out)
+		}
+	}
+
+	// Search by a word that appears only in one request's description, which
+	// proves the haystack is more than the name.
+	out, _ = s.callTool("api_list", map[string]any{"search": "orders"})
+	if !strings.Contains(out, "list-orders") {
+		t.Errorf("search did not find the matching request:\n%s", out)
+	}
+	if strings.Contains(out, "get-user\n") {
+		t.Errorf("search returned a request it should have filtered out:\n%s", out)
+	}
+
+	// A search that matches nothing says so, and says how to see everything.
+	out, _ = s.callTool("api_list", map[string]any{"search": "zzzznothing"})
+	if !strings.Contains(out, "No request matches") {
+		t.Errorf("an empty search result is unclear:\n%s", out)
+	}
+}
+
+// api_describe is what a model reads before filling a call in, so the
+// parameter descriptions the document insists on have to reach it.
+func TestAPIDescribe(t *testing.T) {
+	dir := dataDirWithRepo(t)
+	applyDoc(t, dir, envDoc)
+	applyDoc(t, dir, httpRequestDoc("GET"))
+
+	s := start(t, dir)
+	out, isErr := s.callTool("api_describe", map[string]any{"request": "get-user"})
+	if isErr {
+		t.Fatalf("api_describe failed: %s", out)
+	}
+	for _, want := range []string{"get-user", "Fetch one user by id", "userId", "The user's opaque id", "usr_1a2b", "api_call"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("api_describe is missing %q:\n%s", want, out)
+		}
+	}
+
+	if out, isErr := s.callTool("api_describe", map[string]any{"request": "nope"}); !isErr {
+		t.Errorf("describing an unknown request succeeded: %s", out)
+	}
+}
+
+// A non-GET request is stored but must never be reachable from here, whether
+// through the tool list or by naming it directly.
+func TestNonGetIsNotReachable(t *testing.T) {
 	dir := dataDirWithRepo(t)
 	applyDoc(t, dir, envDoc)
 	applyDoc(t, dir, httpRequestDoc("POST"))
 
 	s := start(t, dir)
-	resp := s.call("tools/list", nil)
-	for _, x := range resp["result"].(map[string]any)["tools"].([]any) {
-		if name := x.(map[string]any)["name"].(string); strings.HasPrefix(name, "call_") {
-			t.Errorf("a POST request was advertised as %q", name)
-		}
+
+	out, _ := s.callTool("api_list", nil)
+	if strings.Contains(out, "get-user") {
+		t.Errorf("a POST request was listed:\n%s", out)
+	}
+	out, isErr := s.callTool("api_describe", map[string]any{"request": "get-user"})
+	if !isErr {
+		t.Errorf("api_describe exposed a POST request: %s", out)
+	}
+	if !strings.Contains(out, "only GET") {
+		t.Errorf("the refusal does not explain itself: %s", out)
 	}
 }
 
@@ -507,8 +577,28 @@ spec:
 	s := start(t, dir)
 	resp := s.call("tools/list", nil)
 	for _, x := range resp["result"].(map[string]any)["tools"].([]any) {
-		if name := x.(map[string]any)["name"].(string); strings.HasPrefix(name, "query_") {
-			t.Errorf("an unhealthy connection was advertised as %q", name)
+		if name := x.(map[string]any)["name"].(string); name == "sql_query" {
+			t.Error("sql_query was offered with no healthy connection behind it")
 		}
+	}
+}
+
+// The search haystack includes parameter descriptions, so a model searching
+// for what a parameter means finds the request that has it.
+func TestAPISearchMatchesParameterDescriptions(t *testing.T) {
+	dir := dataDirWithRepo(t)
+	applyDoc(t, dir, envDoc)
+	applyDoc(t, dir, httpRequestDoc("GET"))
+	applyDoc(t, dir, strings.Replace(
+		strings.Replace(httpRequestDoc("GET"), "name: get-user", "name: get-thing", 1),
+		"The user's opaque id.", "A widget serial number.", 1))
+
+	s := start(t, dir)
+	out, _ := s.callTool("api_list", map[string]any{"search": "widget serial"})
+	if !strings.Contains(out, "get-thing") {
+		t.Errorf("searching a parameter description did not find its request:\n%s", out)
+	}
+	if strings.Contains(out, "get-user\n") {
+		t.Errorf("the search did not filter:\n%s", out)
 	}
 }

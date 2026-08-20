@@ -37,11 +37,15 @@ func (s *Server) callTool(params json.RawMessage) (any, *rpcError) {
 		return s.toolFind(req.Arguments), nil
 	}
 
-	switch {
-	case strings.HasPrefix(req.Name, "call_"):
-		return s.toolCall(objectName(strings.TrimPrefix(req.Name, "call_")), req.Arguments), nil
-	case strings.HasPrefix(req.Name, "query_"):
-		return s.toolQuery(objectName(strings.TrimPrefix(req.Name, "query_")), req.Arguments), nil
+	switch req.Name {
+	case "api_list":
+		return s.toolAPIList(req.Arguments), nil
+	case "api_describe":
+		return s.toolAPIDescribe(req.Arguments), nil
+	case "api_call":
+		return s.toolAPICall(req.Arguments), nil
+	case "sql_query":
+		return s.toolSQLQuery(req.Arguments), nil
 	}
 
 	// Unknown tool is a protocol-level error: the call could not be made at
@@ -180,25 +184,254 @@ func (s *Server) toolFind(raw json.RawMessage) *CallResult {
 
 // --- object tools ---
 
-func (s *Server) toolCall(name string, raw json.RawMessage) *CallResult {
-	args := map[string]string{}
-	if len(raw) > 0 {
-		// Arguments arrive as JSON values, but every parameter is a string on
-		// the wire, so numbers and booleans are coerced rather than refused --
-		// a model passing 42 for an id means "42".
-		var loose map[string]any
-		if err := json.Unmarshal(raw, &loose); err != nil {
-			return toolError("invalid arguments: %v", err)
-		}
-		for k, v := range loose {
-			args[k] = stringify(v)
-		}
+// --- api tools ---
+
+// toolAPIList is the catalogue, with the fuzzy search that makes a large
+// collection usable.
+func (s *Server) toolAPIList(raw json.RawMessage) *CallResult {
+	var args struct {
+		Search string `json:"search"`
+	}
+	if err := decodeArgs(raw, &args); err != nil {
+		return toolError("invalid arguments: %v", err)
 	}
 
-	env := args["environment"]
-	delete(args, "environment")
+	items, err := s.Backend.List(object.KindHTTPRequest)
+	if err != nil {
+		return toolError("%v", err)
+	}
+	// Only what can actually be called from here.
+	var callable []api.ObjectView
+	for _, v := range items {
+		if v.Safe {
+			callable = append(callable, v)
+		}
+	}
+	if len(callable) == 0 {
+		return text("No HTTP requests are configured. Add one by writing an HTTPRequest document -- see docs.md in drover's data directory.")
+	}
 
-	resp, err := s.Backend.Call(name, api.CallRequest{Environment: env, Params: args})
+	matched := rank(callable, args.Search, s.requestSearchable)
+	if len(matched) == 0 {
+		return text("No request matches %q. There are %d configured; call api_list with no search to see them all.",
+			args.Search, len(callable))
+	}
+
+	var b strings.Builder
+	if args.Search != "" {
+		fmt.Fprintf(&b, "%d of %d request(s) match %q:\n\n", len(matched), len(callable), args.Search)
+	} else {
+		fmt.Fprintf(&b, "%d request(s):\n\n", len(matched))
+	}
+	for _, v := range matched {
+		b.WriteString(summarizeRequest(v))
+		b.WriteString("\n")
+	}
+
+	// The environments, because a caller choosing between stage and prod needs
+	// to know which exist and what each one points at.
+	if envs, err := s.Backend.List(object.KindEnvironment); err == nil && len(envs) > 0 {
+		fmt.Fprintf(&b, "%d environment(s):\n", len(envs))
+		for _, e := range envs {
+			b.WriteString(summarizeEnvironment(e))
+		}
+		b.WriteString("\n")
+	}
+
+	b.WriteString("Use api_describe for one request's full parameters, then api_call to perform it.")
+	return text("%s", b.String())
+}
+
+// requestSearchable folds every property into the haystack, so a search hits
+// on anything the document says rather than only on the name.
+func (s *Server) requestSearchable(v api.ObjectView) searchable {
+	fields := []string{
+		strings.ToLower(v.Method),
+		strings.ToLower(v.URL),
+		strings.ToLower(strings.Join(v.Environments, " ")),
+		strings.ToLower(strings.Join(v.Params, " ")),
+	}
+	if d := describeFromYAML(v.YAML, "description"); d != "" {
+		fields = append(fields, strings.ToLower(d))
+	}
+	// Parameter descriptions too: "the org that owns it" should find a request
+	// whose owner parameter says exactly that.
+	if spec, err := specFromYAML(v.YAML); err == nil {
+		for _, p := range spec.PathParams {
+			fields = append(fields, strings.ToLower(p.Name+" "+p.Description))
+		}
+		for _, q := range spec.Query {
+			fields = append(fields, strings.ToLower(q.Name+" "+q.Description))
+		}
+	}
+	return searchable{Name: v.Name, Fields: fields}
+}
+
+func summarizeRequest(v api.ObjectView) string {
+	var b strings.Builder
+	fmt.Fprintf(&b, "  %s\n", v.Name)
+	if d := describeFromYAML(v.YAML, "description"); d != "" {
+		fmt.Fprintf(&b, "      %s\n", firstLine(d))
+	}
+	fmt.Fprintf(&b, "      %s %s\n", v.Method, v.URL)
+	if len(v.Params) > 0 {
+		fmt.Fprintf(&b, "      params: %s\n", strings.Join(v.Params, ", "))
+	}
+	if len(v.Environments) > 0 {
+		envs := make([]string, 0, len(v.Environments))
+		for _, e := range v.Environments {
+			if e == v.DefaultEnvironment {
+				e += " (default)"
+			}
+			envs = append(envs, e)
+		}
+		fmt.Fprintf(&b, "      environments: %s\n", strings.Join(envs, ", "))
+	}
+	return b.String()
+}
+
+func summarizeEnvironment(e api.ObjectView) string {
+	var b strings.Builder
+	fmt.Fprintf(&b, "  %s", e.Name)
+	if d := describeFromYAML(e.YAML, "description"); d != "" {
+		fmt.Fprintf(&b, " — %s", firstLine(d))
+	}
+	b.WriteString("\n")
+	if len(e.Variables) > 0 {
+		fmt.Fprintf(&b, "      variables: %s\n", strings.Join(e.Variables, ", "))
+	}
+	// Secret names and whether they are set -- never their values.
+	if len(e.Secrets) > 0 {
+		var parts []string
+		for _, sec := range e.Secrets {
+			state := "set"
+			if !sec.Set {
+				state = "NOT SET"
+			}
+			parts = append(parts, fmt.Sprintf("%s (%s)", sec.Name, state))
+		}
+		fmt.Fprintf(&b, "      secrets: %s\n", strings.Join(parts, ", "))
+	}
+	return b.String()
+}
+
+// toolAPIDescribe is the detail view: everything needed to fill a call in.
+func (s *Server) toolAPIDescribe(raw json.RawMessage) *CallResult {
+	var args struct {
+		Request string `json:"request"`
+	}
+	if err := decodeArgs(raw, &args); err != nil {
+		return toolError("invalid arguments: %v", err)
+	}
+	if strings.TrimSpace(args.Request) == "" {
+		return toolError("api_describe needs a request name; call api_list to see them")
+	}
+
+	v, err := s.Backend.Get(object.KindHTTPRequest, args.Request)
+	if err != nil {
+		return toolError("%v (call api_list to see the configured requests)", err)
+	}
+	if !v.Safe {
+		return toolError("%s is a %s request and is not available here; only GET requests are offered", v.Name, v.Method)
+	}
+	spec, err := specFromYAML(v.YAML)
+	if err != nil {
+		return toolError("could not read %s: %v", args.Request, err)
+	}
+
+	var b strings.Builder
+	fmt.Fprintf(&b, "%s\n", v.Name)
+	if spec.Description != "" {
+		fmt.Fprintf(&b, "\n%s\n", spec.Description)
+	}
+	fmt.Fprintf(&b, "\n%s %s\n", spec.NormalizedMethod(), spec.URL)
+
+	if len(spec.PathParams) > 0 {
+		b.WriteString("\nPath parameters (all required):\n")
+		for _, p := range spec.PathParams {
+			b.WriteString(describeParam(p, true))
+		}
+	}
+	if len(spec.Query) > 0 {
+		b.WriteString("\nQuery parameters:\n")
+		for _, q := range spec.Query {
+			b.WriteString(describeParam(q, q.Required))
+		}
+	}
+	if len(spec.Headers) > 0 {
+		// Names only. A header value can carry a secret reference, and its
+		// resolved value is never the caller's business.
+		var names []string
+		for _, h := range spec.Headers {
+			names = append(names, h.Name)
+		}
+		fmt.Fprintf(&b, "\nHeaders sent: %s\n", strings.Join(names, ", "))
+	}
+	if len(spec.Environments) > 0 {
+		fmt.Fprintf(&b, "\nEnvironments: %s", strings.Join(spec.Environments, ", "))
+		if spec.DefaultEnvironment != "" {
+			fmt.Fprintf(&b, " (default %s)", spec.DefaultEnvironment)
+		}
+		b.WriteString("\n")
+	}
+
+	fmt.Fprintf(&b, "\nCall it with:\n  api_call { \"request\": %q", v.Name)
+	if required := spec.RequiredParams(); len(required) > 0 {
+		var pairs []string
+		for _, name := range required {
+			pairs = append(pairs, fmt.Sprintf("%q: \"...\"", name))
+		}
+		fmt.Fprintf(&b, ", \"params\": {%s}", strings.Join(pairs, ", "))
+	}
+	b.WriteString(" }\n")
+	return text("%s", b.String())
+}
+
+func describeParam(p object.Param, required bool) string {
+	var b strings.Builder
+	fmt.Fprintf(&b, "  %s", p.Name)
+	if required {
+		b.WriteString(" (required)")
+	}
+	b.WriteString("\n")
+	if p.Description != "" {
+		fmt.Fprintf(&b, "      %s\n", p.Description)
+	}
+	if p.Example != "" {
+		fmt.Fprintf(&b, "      example: %s\n", p.Example)
+	}
+	if p.Default != "" {
+		fmt.Fprintf(&b, "      default: %s\n", p.Default)
+	}
+	return b.String()
+}
+
+// toolAPICall performs one request.
+func (s *Server) toolAPICall(raw json.RawMessage) *CallResult {
+	var args struct {
+		Request     string         `json:"request"`
+		Params      map[string]any `json:"params"`
+		Environment string         `json:"environment"`
+	}
+	if err := decodeArgs(raw, &args); err != nil {
+		return toolError("invalid arguments: %v", err)
+	}
+	if strings.TrimSpace(args.Request) == "" {
+		return toolError("api_call needs a request name; call api_list to see them")
+	}
+
+	// Arguments arrive as JSON values, but every parameter is a string on the
+	// wire, so numbers and booleans are coerced rather than refused -- a model
+	// passing 42 for an id means "42".
+	params := map[string]string{}
+	for k, v := range args.Params {
+		params[k] = stringify(v)
+	}
+
+	resp, err := s.Backend.Call(args.Request, api.CallRequest{
+		Environment: args.Environment,
+		Params:      params,
+	})
 	if err != nil {
 		return toolError("%v", err)
 	}
@@ -222,18 +455,23 @@ func (s *Server) toolCall(name string, raw json.RawMessage) *CallResult {
 	return text("%s", b.String())
 }
 
-func (s *Server) toolQuery(name string, raw json.RawMessage) *CallResult {
+// toolSQLQuery runs one statement against a named connection.
+func (s *Server) toolSQLQuery(raw json.RawMessage) *CallResult {
 	var args struct {
-		Query string `json:"query"`
+		Connection string `json:"connection"`
+		Query      string `json:"query"`
 	}
 	if err := decodeArgs(raw, &args); err != nil {
 		return toolError("invalid arguments: %v", err)
 	}
+	if strings.TrimSpace(args.Connection) == "" {
+		return toolError("sql_query needs a connection; the available ones are listed in this tool's description")
+	}
 	if strings.TrimSpace(args.Query) == "" {
-		return toolError("query needs a SQL statement")
+		return toolError("sql_query needs a SQL statement")
 	}
 
-	res, err := s.Backend.Query(name, args.Query)
+	res, err := s.Backend.Query(args.Connection, args.Query)
 	if err != nil {
 		return toolError("%v", err)
 	}

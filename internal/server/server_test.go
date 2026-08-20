@@ -2,13 +2,16 @@ package server
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/notshekhar/drover/internal/api"
 	"github.com/notshekhar/drover/internal/config"
@@ -500,5 +503,126 @@ func TestBootstrapDedupesDropInAndApplyPath(t *testing.T) {
 	}
 	if err := s.Bootstrap(&config.Config{Apply: []string{path}}); err != nil {
 		t.Fatalf("the same file counted twice: %v", err)
+	}
+}
+
+// Editing a file should be enough; there should be nothing to press.
+func TestWatchAppliesAnEditOnItsOwn(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "repos.yaml")
+	if err := os.WriteFile(path, []byte(repoDoc), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	s, err := New(Options{DataDir: dir, Version: "test", NoSync: true, ConfigPath: filepath.Join(dir, "config.yaml")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Bootstrap(&config.Config{}); err != nil {
+		t.Fatal(err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	reloaded := make(chan string, 4)
+	go s.Watch(ctx, filepath.Join(dir, "config.yaml"), func(msg string, err error) {
+		if err != nil {
+			t.Errorf("watch reported an error: %v", err)
+			return
+		}
+		select {
+		case reloaded <- msg:
+		default:
+		}
+	})
+
+	// Add a second repository the way an agent would: write a file.
+	second := strings.Replace(repoDoc, "name: api", "name: web", 1)
+	if err := os.WriteFile(filepath.Join(dir, "more.yaml"), []byte(second), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	select {
+	case <-reloaded:
+	case <-time.After(20 * time.Second):
+		t.Fatal("the watcher never noticed the new file")
+	}
+
+	objs, err := s.Store().List(object.KindRepository)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(objs) != 2 {
+		t.Fatalf("got %d repositories, want 2 -- the edit was not applied", len(objs))
+	}
+}
+
+// A file still being written must not be applied halfway, and several files
+// saved together should land as one apply rather than erroring in between.
+func TestWatchWaitsForWritesToSettle(t *testing.T) {
+	dir := t.TempDir()
+	s, err := New(Options{DataDir: dir, Version: "test", NoSync: true, ConfigPath: filepath.Join(dir, "config.yaml")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Bootstrap(&config.Config{}); err != nil {
+		t.Fatal(err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	var reloads int32
+	go s.Watch(ctx, filepath.Join(dir, "config.yaml"), func(string, error) {
+		atomic.AddInt32(&reloads, 1)
+	})
+
+	// An HTTPRequest saved before the Environment it names would fail on its
+	// own; written together within the settle window, they apply as one.
+	env := `apiVersion: drover/v1
+kind: Environment
+metadata:
+  name: prod
+spec:
+  variables:
+    baseUrl: https://api.example.com
+`
+	req := `apiVersion: drover/v1
+kind: HTTPRequest
+metadata:
+  name: get-user
+spec:
+  description: Fetch a user.
+  method: GET
+  url: "{{baseUrl}}/users/{userId}"
+  environments: [prod]
+  defaultEnvironment: prod
+  pathParams:
+    - name: userId
+      description: the id
+      required: true
+`
+	if err := os.WriteFile(filepath.Join(dir, "a-request.yaml"), []byte(req), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "b-env.yaml"), []byte(env), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	deadline := time.After(20 * time.Second)
+	for {
+		objs, err := s.Store().List(object.KindHTTPRequest)
+		if err == nil && len(objs) == 1 {
+			break
+		}
+		select {
+		case <-deadline:
+			t.Fatal("the pair was never applied together")
+		case <-time.After(200 * time.Millisecond):
+		}
+	}
+	if n := atomic.LoadInt32(&reloads); n > 2 {
+		t.Errorf("%d reloads for one batch of edits; the settle delay is not working", n)
 	}
 }

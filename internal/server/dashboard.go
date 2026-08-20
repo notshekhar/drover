@@ -3,6 +3,7 @@ package server
 import (
 	"context"
 	"fmt"
+	"sync"
 	"time"
 
 	"github.com/notshekhar/drover/internal/api"
@@ -18,6 +19,14 @@ type Dashboard struct {
 	cfg     *config.Config
 	started time.Time
 	listen  string
+
+	// The watcher reloads on its own, so its result is stashed here for the
+	// next repaint to show. Guarded because the watcher runs on its own
+	// goroutine.
+	mu         sync.Mutex
+	notice     string
+	noticeKind string
+	noticeAt   time.Time
 }
 
 // NewDashboard returns a tui.Source over this server.
@@ -30,7 +39,28 @@ func (s *Server) NewDashboard(cfg *config.Config, listen string) *Dashboard {
 // `drover serve` and `drover dash` render from identical data.
 func (d *Dashboard) Snapshot() tui.Model {
 	state := d.srv.DashboardState(d.listen, d.started)
-	return tui.FromState(state, d.started)
+	m := tui.FromState(state, d.started)
+
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	// A reload the watcher did should be visible for a few seconds, the same
+	// as one someone asked for.
+	if d.notice != "" && time.Since(d.noticeAt) < 8*time.Second {
+		m.Notice, m.NoticeKind = d.notice, d.noticeKind
+	}
+	return m
+}
+
+// NoteReload records what an automatic reload did, for the next repaint.
+func (d *Dashboard) NoteReload(msg string, err error) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	d.noticeAt = time.Now()
+	if err != nil {
+		d.notice, d.noticeKind = err.Error(), "err"
+		return
+	}
+	d.notice, d.noticeKind = msg, "ok"
 }
 
 // DashboardState reads current state off disk.

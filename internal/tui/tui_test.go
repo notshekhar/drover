@@ -56,12 +56,12 @@ func TestRenderShowsEverything(t *testing.T) {
 	for _, want := range []string{
 		"drover 1.2.3",
 		"127.0.0.1:7432/mcp", // the address someone needs to point an agent at
-		"REPOSITORIES (2)",
-		"HTTP REQUESTS (2)",
-		"SQL CONNECTIONS (2)",
-		"ENVIRONMENTS (2)",
+		"REPOSITORIES 2",
+		"HTTP REQUESTS 2",
+		"SQL CONNECTIONS 2",
+		"ENVIRONMENTS 2",
 		"api", "broken", "get-user", "analytics", "prod",
-		"r reload configs", "s sync repos", "q quit",
+		"d summary", "r reload", "s sync", "q quit",
 	} {
 		if !strings.Contains(out, want) {
 			t.Errorf("the screen is missing %q:\n%s", want, out)
@@ -175,6 +175,78 @@ func TestNarrowTerminal(t *testing.T) {
 		out := Render(sample(), w)
 		if !strings.Contains(stripANSI(out), "REPOSITORIES") {
 			t.Errorf("width %d lost the sections", w)
+		}
+	}
+}
+
+// serve shows a summary, not tables: the question it answers at a glance is
+// "is it up and is anything broken".
+func TestSummaryIsCountsNotTables(t *testing.T) {
+	out := stripANSI(RenderSummary(sample(), 78))
+
+	for _, want := range []string{
+		"drover 1.2.3",
+		"127.0.0.1:7432/mcp",
+		"repositories", "http requests", "databases", "environments",
+		"d details", "s sync", "q quit",
+	} {
+		if !strings.Contains(out, want) {
+			t.Errorf("the summary is missing %q:\n%s", want, out)
+		}
+	}
+
+	// The tables belong to the detail view.
+	for _, unwanted := range []string{"BRANCH", "COMMIT", "LAST SYNC", "PROVIDER"} {
+		if strings.Contains(out, unwanted) {
+			t.Errorf("the summary printed a table column %q:\n%s", unwanted, out)
+		}
+	}
+}
+
+// A failure is the one detail worth interrupting a summary for.
+func TestSummaryNamesFailures(t *testing.T) {
+	out := stripANSI(RenderSummary(sample(), 78))
+	if !strings.Contains(out, "broken") {
+		t.Errorf("the summary does not name the failing repository:\n%s", out)
+	}
+	if !strings.Contains(out, "1 failing") {
+		t.Errorf("the summary does not count the failure:\n%s", out)
+	}
+}
+
+// A stored POST is not offered to agents, and the gap between "configured"
+// and "offered" is worth showing.
+func TestSummaryShowsWhatIsOffered(t *testing.T) {
+	out := stripANSI(RenderSummary(sample(), 78))
+	if !strings.Contains(out, "1 offered") {
+		t.Errorf("the summary does not distinguish stored from offered:\n%s", out)
+	}
+}
+
+func TestSummaryWithNothingApplied(t *testing.T) {
+	out := stripANSI(RenderSummary(Model{Version: "1.0.0", Listen: "x:1", Started: time.Now()}, 78))
+	for _, want := range []string{"repositories", "—"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("an empty summary is missing %q:\n%s", want, out)
+		}
+	}
+}
+
+// When the engine watches its own files there is nothing to press, and the
+// screen should not offer a key that does nothing.
+func TestAutoReloadHidesTheReloadKey(t *testing.T) {
+	m := sample()
+	m.AutoReload = true
+
+	for name, out := range map[string]string{
+		"summary": stripANSI(RenderSummary(m, 78)),
+		"detail":  stripANSI(Render(m, 100)),
+	} {
+		if strings.Contains(out, "r reload") {
+			t.Errorf("the %s screen still offers a reload key:\n%s", name, out)
+		}
+		if !strings.Contains(out, "automatically") {
+			t.Errorf("the %s screen does not say edits apply themselves:\n%s", name, out)
 		}
 	}
 }

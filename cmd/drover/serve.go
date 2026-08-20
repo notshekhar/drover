@@ -119,6 +119,8 @@ func cmdServe(args []string) error {
 	}()
 
 	if !dashboard {
+		// No screen to show it on, so the watcher reports through the log.
+		go srv.Watch(ctx, cfgPath, nil)
 		fmt.Fprintf(os.Stderr, "drover %s listening on http://%s (data %s, sync %s)\n",
 			Version, ln.Addr(), dataDir, cfg.SyncInterval())
 		fmt.Fprintf(os.Stderr, "  MCP: http://%s%s\n", ln.Addr(), server.MCPPath)
@@ -138,10 +140,16 @@ func cmdServe(args []string) error {
 		cancelUI()
 	}()
 
+	// Edits apply themselves, so there is no reload key to press.
+	dash := srv.NewDashboard(cfg, ln.Addr().String())
+	go srv.Watch(uiCtx, cfgPath, dash.NoteReload)
+
 	runner := &tui.Runner{
-		Source: srv.NewDashboard(cfg, ln.Addr().String()),
-		In:     os.Stdin,
-		Out:    os.Stderr,
+		Source:     dash,
+		Mode:       tui.Summary,
+		AutoReload: true,
+		In:         os.Stdin,
+		Out:        os.Stderr,
 	}
 	if err := runner.Run(uiCtx); err != nil {
 		// The screen could not be set up (no raw mode, say). That is cosmetic,

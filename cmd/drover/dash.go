@@ -82,6 +82,15 @@ func cmdDash(args []string) error {
 	defer stop()
 
 	src := &remoteSource{c: c, started: time.Now()}
-	runner := &tui.Runner{Source: src, In: os.Stdin, Out: os.Stdout}
+	runner := &tui.Runner{
+		Source: src,
+		// dash opens on the detail view; that is the point of opening it.
+		Mode: tui.Detail,
+		// The engine watches its own files, so a reload key here would be
+		// offering to do something that already happened.
+		AutoReload: true,
+		In:         os.Stdin,
+		Out:        os.Stdout,
+	}
 	return runner.Run(ctx)
 }

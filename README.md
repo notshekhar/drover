@@ -81,8 +81,10 @@ requests and databases an agent is actually offered:
 `●` means an agent is offered it; `○` means it is stored but never advertised
 — a non-GET request, or a database whose health check has not passed.
 
-Press **r** after editing a yaml file and the engine re-reads and applies it,
-no restart. **s** refreshes every repository now.
+**Edits apply themselves.** drover watches its config and the yaml in
+`~/.drover`, so saving a file is enough — there is nothing to press. **d**
+switches between this summary and the full tables, **s** refreshes every
+repository now.
 
 `drover dash` opens the same screen for an engine that is already running,
 including one on another machine (`--server`). `drover serve --no-tui` logs
@@ -279,8 +281,14 @@ Tools an agent gets:
 | `read` | read a file, numbered lines, offset/limit windows |
 | `grep` | RE2 search, with `path` and `include` filters |
 | `find` | glob on the name, or on the whole path when it has a slash |
-| `call_<name>` | one configured HTTP GET |
-| `query_<name>` | one read-only query against a healthy database |
+| `api_list` | find a request by fuzzy search over everything it says; also lists the environments |
+| `api_describe` | one request's parameters in full |
+| `api_call` | perform a request |
+| `sql_query` | one read-only query against a named connection |
+
+**Eight tools, fixed.** Twenty requests do not become twenty tools — they
+become entries `api_list` returns, and the databases are listed inside
+`sql_query`'s own description, the way loop does it.
 
 The file tools are jailed to the checkouts. `..` is rejected, symlinks are
 resolved and re-checked, and walks never follow a link out of the tree.

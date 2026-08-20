@@ -160,19 +160,22 @@ Use ls, read, grep and find to explore the repositories it holds. Paths are rela
 
 Prefer grep and find to locate code, then read the specific file. These are real files on disk, not a search index, so the results are exact.
 
-Tools named call_* perform a specific HTTP GET that someone has configured. Tools named query_* run a read-only SQL query against a configured database.`
+For APIs: api_list finds a configured HTTP request (it takes a fuzzy search and also lists the environments), api_describe shows one request's parameters, and api_call performs it. Only GET requests are available.
+
+For databases: sql_query runs one read-only statement against a named connection. The connections are listed in that tool's own description.`
 
 // --- tools/list ---
 
+// The tool set is FIXED at eight, whatever is applied.
+//
+// One tool per object does not survive contact with a real collection: twenty
+// requests became twenty tools, every one of them re-sent on every tools/list
+// and all of them competing for the model's attention. The catalogue belongs
+// in a tool's arguments, not in the tool list.
 func (s *Server) listTools(json.RawMessage) (any, *rpcError) {
 	tools := append([]Tool(nil), fileTools...)
-
-	// The dynamic half: whatever has been applied. An engine that is
-	// unreachable still lists the file tools, because a partial answer beats
-	// failing the whole call.
-	tools = append(tools, s.requestTools()...)
+	tools = append(tools, s.apiTools()...)
 	tools = append(tools, s.sqlTools()...)
-
 	return map[string]any{"tools": tools}, nil
 }
 
@@ -236,161 +239,168 @@ var fileTools = []Tool{
 	},
 }
 
-// requestTools advertises every stored HTTPRequest that is a GET.
+// apiTools are the three that cover every configured HTTP request.
 //
-// Non-GET requests are stored but never advertised, so an agent is not handed
-// a way to write to somebody's API.
-func (s *Server) requestTools() []Tool {
-	items, err := s.Backend.List(object.KindHTTPRequest)
-	if err != nil {
+// api_call's description stays the same length whether one request is
+// configured or two hundred; discovery happens through api_list.
+func (s *Server) apiTools() []Tool {
+	count, envs := s.apiCounts()
+	if count == 0 {
+		// Nothing configured: advertising tools that can only fail wastes a
+		// slot and invites the model to try them.
 		return nil
 	}
 
-	var out []Tool
-	for _, v := range items {
-		if !v.Safe {
-			continue
-		}
-		props := map[string]Prop{}
-		var required []string
-
-		for _, name := range v.Params {
-			props[name] = Prop{Type: "string", Description: "Required parameter."}
-			required = append(required, name)
-		}
-		// The engine knows each parameter's real description; fetch the object
-		// so the model gets it rather than a placeholder.
-		if detail, err := s.Backend.Get(object.KindHTTPRequest, v.Name); err == nil {
-			applyParamDocs(detail, props, &required)
-		}
-		if len(v.Environments) > 1 {
-			props["environment"] = Prop{
-				Type:        "string",
-				Description: environmentDescription(v),
-				Enum:        v.Environments,
-			}
-		}
-
-		sort.Strings(required)
-		out = append(out, Tool{
-			Name:        "call_" + toolSuffix(v.Name),
-			Description: requestDescription(v),
-			InputSchema: Schema{Type: "object", Properties: props, Required: required, Additional: boolPtr(false)},
-		})
+	return []Tool{
+		{
+			Name: "api_list",
+			Description: fmt.Sprintf(
+				"List the HTTP requests drover can perform, and the environments they run against. "+
+					"%d request(s) and %d environment(s) are configured. "+
+					"Call this first to find the request you need, then api_describe for its parameters, then api_call to perform it. "+
+					"With no search argument it returns everything.",
+				count, envs),
+			InputSchema: Schema{
+				Type:       "object",
+				Additional: boolPtr(false),
+				Properties: map[string]Prop{
+					"search": {
+						Type:        "string",
+						Description: "Optional fuzzy search. Matches against every property of a request -- its name, description, method, url, parameter names and descriptions, and environments -- so `issues`, `github repos` or an abbreviation all work. Omit to list everything.",
+					},
+				},
+			},
+		},
+		{
+			Name:        "api_describe",
+			Description: "Show one HTTP request in full: what it does, its url, every parameter with its description and example, which environments it runs against, and which headers it sends. Use this before api_call when you are unsure what a request needs.",
+			InputSchema: Schema{
+				Type:       "object",
+				Additional: boolPtr(false),
+				Required:   []string{"request"},
+				Properties: map[string]Prop{
+					"request": {Type: "string", Description: "Name of the request, as returned by api_list."},
+				},
+			},
+		},
+		{
+			Name: "api_call",
+			Description: "Perform one of the configured HTTP requests and return the response. " +
+				"Only GET requests are available here; anything that writes is deliberately not offered. " +
+				"Use api_list to find a request and api_describe to see what it needs.",
+			InputSchema: Schema{
+				Type:       "object",
+				Additional: boolPtr(false),
+				Required:   []string{"request"},
+				Properties: map[string]Prop{
+					"request": {Type: "string", Description: "Name of the request, as returned by api_list."},
+					"params": {
+						Type:        "object",
+						Description: "The request's parameters as name/value pairs, e.g. {\"owner\": \"golang\", \"repo\": \"go\"}. See api_describe for which are required.",
+					},
+					"environment": {Type: "string", Description: "Which environment to run against. Omit to use the request's default."},
+				},
+			},
+		},
 	}
-	return out
 }
 
-func environmentDescription(v api.ObjectView) string {
-	if v.DefaultEnvironment != "" {
-		return fmt.Sprintf("Which environment to run against. Defaults to %s.", v.DefaultEnvironment)
-	}
-	return "Which environment to run against."
-}
-
-func requestDescription(v api.ObjectView) string {
-	var b strings.Builder
-	if d := describeFromYAML(v.YAML, "description"); d != "" {
-		b.WriteString(d)
-	} else {
-		b.WriteString(fmt.Sprintf("Perform the %s request.", v.Name))
-	}
-	b.WriteString(fmt.Sprintf("\n\nHTTP %s %s", v.Method, v.URL))
-	if len(v.Environments) > 0 {
-		b.WriteString("\nEnvironments: " + strings.Join(v.Environments, ", "))
-		if v.DefaultEnvironment != "" {
-			b.WriteString(" (default " + v.DefaultEnvironment + ")")
-		}
-	}
-	return b.String()
-}
-
-// applyParamDocs replaces placeholder descriptions with the ones written in
-// the document, which is the whole reason drover insists on them at apply.
-func applyParamDocs(v *api.ObjectView, props map[string]Prop, required *[]string) {
-	spec, err := specFromYAML(v.YAML)
+// apiCounts reports how many callable requests and environments exist, which
+// is what the api_list description quotes.
+func (s *Server) apiCounts() (requests, environments int) {
+	items, err := s.Backend.List(object.KindHTTPRequest)
 	if err != nil {
-		return
+		return 0, 0
 	}
-	for _, p := range spec.PathParams {
-		prop := props[p.Name]
-		prop.Type = "string"
-		prop.Description = p.Description
-		if p.Example != "" {
-			prop.Description += fmt.Sprintf(" Example: %s", p.Example)
-		}
-		props[p.Name] = prop
-	}
-	for _, q := range spec.Query {
-		prop, existed := props[q.Name]
-		prop.Type = "string"
-		prop.Description = q.Description
-		if q.Example != "" {
-			prop.Description += fmt.Sprintf(" Example: %s", q.Example)
-		}
-		props[q.Name] = prop
-		if !existed && q.Required {
-			*required = append(*required, q.Name)
+	for _, v := range items {
+		if v.Safe {
+			requests++
 		}
 	}
+	if envs, err := s.Backend.List(object.KindEnvironment); err == nil {
+		environments = len(envs)
+	}
+	return requests, environments
 }
 
-// sqlTools advertises one query tool per healthy SQLConnection.
-//
-// The health gate is the point: a connection whose health query has not
-// passed is not offered at all, because an agent handed a database it cannot
-// reach will keep trying.
+// sqlTools is loop's shape: one query tool, with the catalogue of connections
+// in its description so the model can pick the right one.
 func (s *Server) sqlTools() []Tool {
 	items, err := s.Backend.List(object.KindSQLConnection)
 	if err != nil {
 		return nil
 	}
 
-	var out []Tool
+	var ready []api.ObjectView
 	for _, v := range items {
-		if v.Status != "ready" {
-			continue
+		// The health gate: a connection that has not passed is not offered,
+		// because an agent handed a database it cannot reach will keep trying.
+		if v.Status == "ready" {
+			ready = append(ready, v)
 		}
-		out = append(out, Tool{
-			Name:        "query_" + toolSuffix(v.Name),
-			Description: sqlDescription(v),
-			InputSchema: Schema{
-				Type:       "object",
-				Additional: boolPtr(false),
-				Required:   []string{"query"},
-				Properties: map[string]Prop{
-					"query": {Type: "string", Description: "One read-only SQL statement. Send a single statement, not several separated by semicolons."},
-				},
-			},
-		})
 	}
-	return out
+	if len(ready) == 0 {
+		return nil
+	}
+
+	return []Tool{{
+		Name: "sql_query",
+		Description: "Run a READ-ONLY SQL query against one of the configured databases and return the rows. " +
+			"Only SELECT / WITH / SHOW / EXPLAIN / DESCRIBE / VALUES / TABLE statements are allowed -- anything that writes is rejected, and so is sending two statements at once. " +
+			"Use information_schema (or the dialect's own catalog) to discover tables and columns before querying, and add a LIMIT to exploratory queries.\n\n" +
+			connectionCatalog(ready),
+		InputSchema: Schema{
+			Type:       "object",
+			Additional: boolPtr(false),
+			Required:   []string{"connection", "query"},
+			Properties: map[string]Prop{
+				"connection": {
+					Type:        "string",
+					Description: "Which database to query -- one of the connections listed in this tool's description.",
+					Enum:        connectionNames(ready),
+				},
+				"query": {Type: "string", Description: "A single read-only SQL statement."},
+			},
+		},
+	}}
 }
 
-func sqlDescription(v api.ObjectView) string {
+// connectionCatalog is the list the model reads to choose a connection. The
+// dialect is included because Redshift and Postgres are not the same thing to
+// somebody writing SQL.
+func connectionCatalog(items []api.ObjectView) string {
 	var b strings.Builder
-	if d := describeFromYAML(v.YAML, "description"); d != "" {
-		b.WriteString(d)
-		b.WriteString("\n\n")
-	}
-	provider, _ := object.ParseProvider(v.Provider)
-	b.WriteString(fmt.Sprintf("Run a read-only query against the %s database %q.", v.Provider, v.Name))
-	if dialect := provider.Dialect(); dialect != "" {
-		b.WriteString("\nDialect: " + dialect)
-	}
-	if v.ReadOnly {
-		b.WriteString("\nOnly SELECT, WITH, SHOW, EXPLAIN, DESCRIBE, VALUES and TABLE are permitted; writes are refused.")
-	}
-	if v.MaxRows > 0 {
-		b.WriteString(fmt.Sprintf("\nAt most %d rows are returned; add LIMIT and filters to narrow the result.", v.MaxRows))
+	b.WriteString("Available connection values:\n")
+	for _, v := range items {
+		provider, _ := object.ParseProvider(v.Provider)
+		line := fmt.Sprintf("  - %s (%s", v.Name, v.Provider)
+		if d := describeFromYAML(v.YAML, "description"); d != "" {
+			line += " · " + firstLine(d)
+		}
+		line += ")"
+		if dialect := provider.Dialect(); dialect != "" && dialect != v.Provider {
+			line += "\n      dialect: " + dialect
+		}
+		if v.MaxRows > 0 {
+			line += fmt.Sprintf("\n      at most %d rows are returned", v.MaxRows)
+		}
+		b.WriteString(line + "\n")
 	}
 	return b.String()
 }
 
-// toolSuffix turns an object name into a tool-name segment. Object names are
-// already lowercase alphanumerics and dashes; MCP tool names conventionally
-// use underscores.
-func toolSuffix(name string) string { return strings.ReplaceAll(name, "-", "_") }
+func connectionNames(items []api.ObjectView) []string {
+	out := make([]string, 0, len(items))
+	for _, v := range items {
+		out = append(out, v.Name)
+	}
+	sort.Strings(out)
+	return out
+}
 
-// objectName reverses toolSuffix.
-func objectName(suffix string) string { return strings.ReplaceAll(suffix, "_", "-") }
+func firstLine(s string) string {
+	if i := strings.IndexByte(s, '\n'); i >= 0 {
+		return s[:i]
+	}
+	return s
+}

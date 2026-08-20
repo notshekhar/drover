@@ -15,6 +15,16 @@ import (
 // are ages and statuses, so a second is plenty and keeps the process idle.
 const RefreshInterval = time.Second
 
+// Mode is which screen to draw.
+type Mode int
+
+const (
+	// Summary is what `drover serve` shows: counts and health.
+	Summary Mode = iota
+	// Detail is what `drover dash` shows: the full tables.
+	Detail
+)
+
 // Source supplies the current state and the two actions the screen offers.
 type Source interface {
 	// Snapshot is the state to draw. It is called on every repaint, so it
@@ -32,8 +42,13 @@ type Source interface {
 // Runner drives the dashboard.
 type Runner struct {
 	Source Source
+	Mode   Mode
 	In     *os.File
 	Out    io.Writer
+
+	// AutoReload says the engine re-applies edits on its own, so the screen
+	// offers no reload key and says as much.
+	AutoReload bool
 }
 
 // Supported reports whether a dashboard can be drawn at all. Without a
@@ -76,6 +91,10 @@ func (r *Runner) Run(ctx context.Context) error {
 	var noticeKind string
 	var noticeUntil time.Time
 	reloading := false
+	// Mode is toggled by a key, so it is local rather than read off the
+	// Runner: serve opens on the summary, dash opens on the detail, and
+	// either can switch without restarting anything.
+	mode := r.Mode
 
 	// A reload runs off the paint loop so a slow clone does not freeze the
 	// screen; the result comes back here.
@@ -91,7 +110,16 @@ func (r *Runner) Run(ctx context.Context) error {
 			notice, noticeKind = "", ""
 			noticeUntil = time.Time{}
 		}
-		m.Notice, m.NoticeKind, m.Reloading = notice, noticeKind, reloading
+		if m.Notice == "" {
+			m.Notice, m.NoticeKind = notice, noticeKind
+		}
+		m.Reloading = reloading
+		m.AutoReload = r.AutoReload
+
+		if mode == Summary {
+			fmt.Fprint(r.Out, RenderSummary(m, width(r.In)))
+			return
+		}
 		fmt.Fprint(r.Out, Render(m, width(r.In)))
 	}
 	paint()
@@ -122,8 +150,17 @@ func (r *Runner) Run(ctx context.Context) error {
 			case 'q', 'Q', 3: // 3 is ctrl-c, which raw mode delivers as a byte
 				return nil
 
+			case 'd', 'D':
+				if mode == Summary {
+					mode = Detail
+				} else {
+					mode = Summary
+				}
+				paint()
+
 			case 'r', 'R':
-				if reloading {
+				if r.AutoReload || reloading {
+					// Nothing to press when edits apply themselves.
 					break
 				}
 				reloading = true

@@ -29,8 +29,9 @@ After writing a file:
 drover apply -f ~/.drover/repos.yaml   # apply it now
 ```
 
-or press **r** in the `drover serve` dashboard, or restart the engine. All
-three do the same thing.
+You do not have to do even that: drover watches this folder, so saving a file
+is enough. `drover apply -f` is for checking a file's errors before you rely
+on it.
 
 Check what landed:
 
@@ -175,7 +176,9 @@ spec:
   `"Bearer ${TOKEN}"` — put the `Bearer ` prefix in the request that uses it.
   This is what stops a credential ending up in a file someone commits.
 - Secret values are read from the **engine's** environment, so set them
-  wherever `drover serve` runs, then restart it. Their values are never
+  wherever `drover serve` runs, then restart it. (Editing yaml is picked up
+  automatically; a new environment variable is not, because the engine's own
+  environment is fixed when it starts.) Their values are never
   printed, never logged, and never shown to an agent.
 - A secret whose variable is unset does not fail the apply. It fails when a
   request that needs it is actually called, and says which variable is
@@ -419,8 +422,14 @@ The agent then has:
 | `read` | read a file, with line numbers |
 | `grep` | regular-expression search across the checkouts |
 | `find` | find files by name or path pattern |
-| `call_<name>` | one of your GET requests |
-| `query_<name>` | a read-only query against one of your healthy databases |
+| `api_list` | find a request, with a fuzzy search over everything a request says; also lists the environments |
+| `api_describe` | one request's parameters in full |
+| `api_call` | perform a request |
+| `sql_query` | a read-only query against a named connection |
+
+The tool set is **fixed at eight** however much you add. Twenty requests do
+not become twenty tools — they become entries `api_list` returns, and the
+databases are listed inside `sql_query`'s own description.
 
 Everything an agent can reach is read-only. There is no tool that writes a
 file, none that POSTs, and none that writes to a database.
