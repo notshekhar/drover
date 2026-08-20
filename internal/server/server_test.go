@@ -525,8 +525,12 @@ func TestWatchAppliesAnEditOnItsOwn(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
+	// The baseline is taken here, before the new file is written, which is the
+	// whole reason NewWatcher is separate from Run.
+	watcher := s.NewWatcher(filepath.Join(dir, "config.yaml"))
+
 	reloaded := make(chan string, 4)
-	go s.Watch(ctx, filepath.Join(dir, "config.yaml"), func(msg string, err error) {
+	go watcher.Run(ctx, func(msg string, err error) {
 		if err != nil {
 			t.Errorf("watch reported an error: %v", err)
 			return
@@ -574,7 +578,8 @@ func TestWatchWaitsForWritesToSettle(t *testing.T) {
 	defer cancel()
 
 	var reloads int32
-	go s.Watch(ctx, filepath.Join(dir, "config.yaml"), func(string, error) {
+	watcher := s.NewWatcher(filepath.Join(dir, "config.yaml"))
+	go watcher.Run(ctx, func(string, error) {
 		atomic.AddInt32(&reloads, 1)
 	})
 

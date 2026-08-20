@@ -27,12 +27,28 @@ const WatchInterval = time.Second
 // names would fail on its own.
 const settleDelay = 750 * time.Millisecond
 
-// Watch re-applies the config and the data directory's yaml whenever they
+// Watcher re-applies the config and the data directory's yaml whenever they
 // change on disk, so editing a file is enough and there is nothing to press.
+type Watcher struct {
+	srv     *Server
+	cfgPath string
+	last    string
+}
+
+// NewWatcher records the current state of the files and returns a watcher for
+// them.
 //
-// onReload is called with the outcome so a dashboard can show it.
-func (s *Server) Watch(ctx context.Context, cfgPath string, onReload func(msg string, err error)) {
-	last := s.fingerprint(cfgPath)
+// The baseline is taken here, synchronously, rather than inside Run. Taking it
+// in the goroutine meant anything written between starting the watcher and the
+// goroutine being scheduled was already in the baseline, so it never looked
+// like a change and was never applied.
+func (s *Server) NewWatcher(cfgPath string) *Watcher {
+	return &Watcher{srv: s, cfgPath: cfgPath, last: s.fingerprint(cfgPath)}
+}
+
+// Run watches until the context is cancelled. onReload is called with the
+// outcome of each apply, so a dashboard can show it.
+func (w *Watcher) Run(ctx context.Context, onReload func(msg string, err error)) {
 	var pendingSince time.Time
 
 	ticker := time.NewTicker(WatchInterval)
@@ -45,11 +61,11 @@ func (s *Server) Watch(ctx context.Context, cfgPath string, onReload func(msg st
 		case <-ticker.C:
 		}
 
-		current := s.fingerprint(cfgPath)
-		if current != last {
+		current := w.srv.fingerprint(w.cfgPath)
+		if current != w.last {
 			// Something moved; restart the settle timer rather than applying
 			// a file that may still be being written.
-			last = current
+			w.last = current
 			pendingSince = time.Now()
 			continue
 		}
@@ -58,15 +74,15 @@ func (s *Server) Watch(ctx context.Context, cfgPath string, onReload func(msg st
 		}
 		pendingSince = time.Time{}
 
-		msg, _, err := s.Reload(cfgPath)
+		msg, _, err := w.srv.Reload(w.cfgPath)
 		if onReload != nil {
 			onReload(msg, err)
 		}
 		if err != nil {
-			s.logf("reload failed: %v", err)
+			w.srv.logf("reload failed: %v", err)
 			continue
 		}
-		s.logf("%s", msg)
+		w.srv.logf("%s", msg)
 	}
 }
 

@@ -11,8 +11,10 @@ package tui
 
 import (
 	"fmt"
+	"os"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/notshekhar/drover/internal/api"
 )
@@ -126,15 +128,22 @@ func Render(m Model, width int) string {
 }
 
 func header(b *strings.Builder, m Model, width int) {
-	// One line: the name, the two addresses someone actually needs, and how
-	// long it has been up. The data directory goes underneath because it is
-	// long and nobody reads it twice.
-	fmt.Fprintf(b, "\n %s%sdrover%s %s%s%s   %shttp://%s%s   %smcp%s http://%s/mcp   %s%s%s\n",
-		bold, cyan, reset, dim, m.Version, reset,
-		dim, m.Listen, reset,
-		dim, reset, m.Listen,
-		dim, humanDuration(time.Since(m.Started)), reset)
-	fmt.Fprintf(b, " %s%s%s\n", dim, truncate(m.DataDir, width-2), reset)
+	// The name, the addresses someone actually needs, and how long it has been
+	// up. On a narrow terminal the MCP url moves to its own line rather than
+	// wrapping, since it is the one people copy.
+	uptime := humanDuration(time.Since(m.Started))
+	oneLine := 9 + len(m.Version) + len(m.Listen)*2 + len(uptime) + 24
+
+	fmt.Fprintf(b, "\n %s%sdrover%s %s%s%s   %shttp://%s%s",
+		bold, cyan, reset, dim, m.Version, reset, dim, m.Listen, reset)
+	if oneLine <= width {
+		fmt.Fprintf(b, "   %smcp%s http://%s/mcp   %s%s%s\n",
+			dim, reset, m.Listen, dim, uptime, reset)
+	} else {
+		fmt.Fprintf(b, "   %s%s%s\n", dim, uptime, reset)
+		fmt.Fprintf(b, " %smcp%s http://%s/mcp\n", dim, reset, m.Listen)
+	}
+	fmt.Fprintf(b, " %s%s%s\n", dim, truncate(homeShort(m.DataDir), width-2), reset)
 }
 
 func section(b *strings.Builder, label string, n int, width int) {
@@ -155,8 +164,29 @@ func repoTable(b *strings.Builder, repos []Repo, width int) {
 		return
 	}
 
-	fmt.Fprintf(b, "   %s%-18s %-24s %-9s %-8s %-8s %s%s\n",
-		dim, "NAME", "SOURCE", "BRANCH", "COMMIT", "REFRESH", "SYNCED", reset)
+	// Columns are dropped by priority rather than allowed to wrap, because a
+	// wrapped row is unreadable while a missing column is merely less
+	// informative. Where a repository came from goes first; how fresh it is
+	// goes last.
+	showSource := width >= 92
+	showCommit := width >= 68
+	showRefresh := width >= 60
+
+	var head strings.Builder
+	fmt.Fprintf(&head, "   %s%-18s", dim, "NAME")
+	if showSource {
+		fmt.Fprintf(&head, " %-24s", "SOURCE")
+	}
+	fmt.Fprintf(&head, " %-9s", "BRANCH")
+	if showCommit {
+		fmt.Fprintf(&head, " %-8s", "COMMIT")
+	}
+	if showRefresh {
+		fmt.Fprintf(&head, " %-8s", "REFRESH")
+	}
+	fmt.Fprintf(&head, " %s%s\n", "SYNCED", reset)
+	b.WriteString(head.String())
+
 	for _, r := range repos {
 		mark := green + "●" + reset
 		switch r.Status {
@@ -167,15 +197,20 @@ func repoTable(b *strings.Builder, repos []Repo, width int) {
 		case "pending", "":
 			mark = dim + "○" + reset
 		}
-		fmt.Fprintf(b, " %s %-18s %s%-24s%s %-9s %-8s %-8s %s\n",
-			mark,
-			truncate(r.Name, 18),
-			dim, truncate(shortRemote(r.URL), 24), reset,
-			truncate(r.Branch, 9),
-			shortCommit(r.Commit),
-			truncate(r.Refresh, 8),
-			relativeTime(r.LastSync),
-		)
+
+		fmt.Fprintf(b, " %s %-18s", mark, truncate(r.Name, 18))
+		if showSource {
+			fmt.Fprintf(b, " %s%-24s%s", dim, truncate(shortRemote(r.URL), 24), reset)
+		}
+		fmt.Fprintf(b, " %-9s", truncate(r.Branch, 9))
+		if showCommit {
+			fmt.Fprintf(b, " %-8s", shortCommit(r.Commit))
+		}
+		if showRefresh {
+			fmt.Fprintf(b, " %-8s", truncate(r.Refresh, 8))
+		}
+		fmt.Fprintf(b, " %s\n", relativeTime(r.LastSync))
+
 		// A failure is the reason someone opened this screen, so it gets its
 		// own line rather than being clipped into a column.
 		if r.Error != "" {
@@ -190,6 +225,10 @@ func requestTable(b *strings.Builder, reqs []Request, width int) {
 		fmt.Fprintf(b, "   %snone%s\n", dim, reset)
 		return
 	}
+	urlWidth := width - 44
+	if urlWidth < 8 {
+		urlWidth = 8
+	}
 	fmt.Fprintf(b, "   %s%-18s %-7s %-12s %s%s\n", dim, "NAME", "METHOD", "ENVIRONMENT", "URL", reset)
 	for _, r := range reqs {
 		offered := green + "●" + reset
@@ -202,7 +241,7 @@ func requestTable(b *strings.Builder, reqs []Request, width int) {
 			truncate(r.Name, 18),
 			truncate(r.Method, 7),
 			truncate(r.Environment, 12),
-			dim, truncate(r.URL, maxInt(10, width-48)), reset)
+			dim, truncate(r.URL, urlWidth), reset)
 	}
 }
 
@@ -350,21 +389,39 @@ func shortRemote(url string) string {
 	return s
 }
 
-func pad(s string, n int) string {
-	if len(s) >= n {
-		return s
+// homeShort replaces the home directory with ~, because the data directory is
+// almost always under it and the prefix is the least interesting part of a
+// path that has to share a line.
+func homeShort(path string) string {
+	home, err := os.UserHomeDir()
+	if err != nil || home == "" || !strings.HasPrefix(path, home) {
+		return path
 	}
-	return s + strings.Repeat(" ", n-len(s))
+	return "~" + path[len(home):]
 }
 
+func pad(s string, n int) string {
+	w := utf8.RuneCountInString(s)
+	if w >= n {
+		return s
+	}
+	return s + strings.Repeat(" ", n-w)
+}
+
+// truncate clips to n columns, counting runes rather than bytes.
+//
+// Bytes would cut a multi-byte character in half and print a replacement
+// glyph, and would also make every box-drawing rule look three times too
+// long to any code measuring it.
 func truncate(s string, n int) string {
 	if n <= 1 {
 		return ""
 	}
-	if len(s) <= n {
+	if utf8.RuneCountInString(s) <= n {
 		return s
 	}
-	return s[:n-1] + "…"
+	runes := []rune(s)
+	return string(runes[:n-1]) + "…"
 }
 
 func firstLine(s string) string {

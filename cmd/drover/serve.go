@@ -109,40 +109,52 @@ func cmdServe(args []string) error {
 		ln.Close()
 	}()
 
-	serveErr := make(chan error, 1)
+	// One sender, one closed channel, any number of waiters.
+	//
+	// This was a chan error with two receivers: the goroutine that took the
+	// UI down on a listener failure raced the main path's own receive, and
+	// whichever lost blocked forever. Quitting the dashboard hung the process
+	// -- including ctrl-c, since raw mode delivers that as a byte through the
+	// same quit path rather than as a signal. close() broadcasts, so nobody
+	// can consume the other's wakeup.
+	var serveErr error
+	serveDone := make(chan struct{})
 	go func() {
 		err := srv.Serve(ln)
 		if err != nil && errors.Is(err, net.ErrClosed) {
 			err = nil
 		}
-		serveErr <- err
+		serveErr = err
+		close(serveDone)
 	}()
 
 	if !dashboard {
 		// No screen to show it on, so the watcher reports through the log.
-		go srv.Watch(ctx, cfgPath, nil)
+		go srv.NewWatcher(cfgPath).Run(ctx, nil)
 		fmt.Fprintf(os.Stderr, "drover %s listening on http://%s (data %s, sync %s)\n",
 			Version, ln.Addr(), dataDir, cfg.SyncInterval())
 		fmt.Fprintf(os.Stderr, "  MCP: http://%s%s\n", ln.Addr(), server.MCPPath)
 		fmt.Fprintf(os.Stderr, "  add it with: claude mcp add --transport http drover http://%s%s\n",
 			ln.Addr(), server.MCPPath)
-		err := <-serveErr
+		<-serveDone
 		fmt.Fprintln(os.Stderr, "drover stopped")
-		return err
+		return serveErr
 	}
 
 	// Quitting the dashboard stops the engine: it is the foreground process
 	// the user started, so closing it should not leave a daemon behind.
 	uiCtx, cancelUI := context.WithCancel(ctx)
 	defer cancelUI()
+	// If the listener dies on its own, take the dashboard down with it.
 	go func() {
-		<-serveErr
+		<-serveDone
 		cancelUI()
 	}()
 
 	// Edits apply themselves, so there is no reload key to press.
 	dash := srv.NewDashboard(cfg, ln.Addr().String())
-	go srv.Watch(uiCtx, cfgPath, dash.NoteReload)
+	watcher := srv.NewWatcher(cfgPath)
+	go watcher.Run(uiCtx, dash.NoteReload)
 
 	runner := &tui.Runner{
 		Source:     dash,
@@ -155,10 +167,12 @@ func cmdServe(args []string) error {
 		// The screen could not be set up (no raw mode, say). That is cosmetic,
 		// so fall back to serving rather than refusing to run at all.
 		fmt.Fprintf(os.Stderr, "dashboard unavailable (%v); serving on http://%s\n", err, ln.Addr())
-		return <-serveErr
+		<-serveDone
+		return serveErr
 	}
 
 	ln.Close()
-	<-serveErr
-	return nil
+	<-serveDone
+	fmt.Fprintln(os.Stderr, "drover stopped")
+	return serveErr
 }

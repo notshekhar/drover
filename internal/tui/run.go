@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"strings"
 	"time"
 
 	"golang.org/x/term"
@@ -117,10 +118,10 @@ func (r *Runner) Run(ctx context.Context) error {
 		m.AutoReload = r.AutoReload
 
 		if mode == Summary {
-			fmt.Fprint(r.Out, RenderSummary(m, width(r.In)))
+			fmt.Fprint(r.Out, crlf(RenderSummary(m, width(r.In))))
 			return
 		}
-		fmt.Fprint(r.Out, Render(m, width(r.In)))
+		fmt.Fprint(r.Out, crlf(Render(m, width(r.In))))
 	}
 	paint()
 
@@ -216,6 +217,20 @@ func readKeys(in *os.File, out chan<- byte) {
 			return
 		}
 	}
+}
+
+// crlf turns every newline into a carriage return plus newline.
+//
+// Raw mode clears ONLCR, so the terminal stops translating "\n" into "move
+// down AND return to column 0" -- it only moves down. Text written with plain
+// newlines then walks diagonally across the screen, each line starting where
+// the previous one ended. The renderers stay readable and testable with plain
+// "\n"; the translation happens once, here, on the way to the terminal.
+func crlf(s string) string {
+	// Normalise first so a string that already has \r\n does not become
+	// \r\r\n, which some terminals render as a blank line.
+	s = strings.ReplaceAll(s, "\r\n", "\n")
+	return strings.ReplaceAll(s, "\n", "\r\n")
 }
 
 func width(f *os.File) int {

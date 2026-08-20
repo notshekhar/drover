@@ -4,6 +4,7 @@ import (
 	"strings"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	"github.com/notshekhar/drover/internal/api"
 )
@@ -247,6 +248,51 @@ func TestAutoReloadHidesTheReloadKey(t *testing.T) {
 		}
 		if !strings.Contains(out, "automatically") {
 			t.Errorf("the %s screen does not say edits apply themselves:\n%s", name, out)
+		}
+	}
+}
+
+// Raw mode clears ONLCR, so a bare "\n" moves the cursor down without
+// returning it to column 0 and every line starts where the last one ended.
+// The renderers use plain newlines; the runner is what must translate them.
+func TestRunnerTranslatesNewlinesForRawMode(t *testing.T) {
+	in := "one\ntwo\nthree\n"
+	got := crlf(in)
+	if got != "one\r\ntwo\r\nthree\r\n" {
+		t.Errorf("crlf(%q) = %q", in, got)
+	}
+
+	// Already-translated text must not become \r\r\n, which some terminals
+	// render as an extra blank line.
+	if got := crlf("a\r\nb\r\n"); got != "a\r\nb\r\n" {
+		t.Errorf("crlf double-translated: %q", got)
+	}
+
+	// Every newline in a real frame, translated.
+	frame := crlf(RenderSummary(sample(), 78))
+	for i := 0; i < len(frame); i++ {
+		if frame[i] == '\n' && (i == 0 || frame[i-1] != '\r') {
+			t.Fatalf("a bare newline survived at byte %d; the screen will stair-step", i)
+		}
+	}
+}
+
+// Long paths must not wrap the screen; the home prefix is the least
+// interesting part of one that has to share a line.
+func TestLongPathsAreShortenedAndClipped(t *testing.T) {
+	m := sample()
+	m.DataDir = "/very/long/path/that/keeps/going/and/going/and/going/for/ages/dot-drover"
+	m.AutoReload = true
+
+	for name, out := range map[string]string{
+		"summary": stripANSI(RenderSummary(m, 60)),
+		"detail":  stripANSI(Render(m, 60)),
+	} {
+		for _, line := range strings.Split(out, "\n") {
+			// Runes, not bytes: a box-drawing rule is three bytes per column.
+			if w := utf8.RuneCountInString(line); w > 60 {
+				t.Errorf("the %s screen has a %d-column line in a 60-column terminal:\n%q", name, w, line)
+			}
 		}
 	}
 }

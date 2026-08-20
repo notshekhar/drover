@@ -26,7 +26,7 @@ func RenderSummary(m Model, width int) string {
 
 	fmt.Fprintf(&b, "  %sengine%s  http://%s\n", dim, reset, m.Listen)
 	fmt.Fprintf(&b, "  %sMCP%s     http://%s/mcp\n", dim, reset, m.Listen)
-	fmt.Fprintf(&b, "  %sdata%s    %s\n", dim, reset, m.DataDir)
+	fmt.Fprintf(&b, "  %sdata%s    %s\n", dim, reset, truncate(homeShort(m.DataDir), width-12))
 	fmt.Fprintf(&b, "  %suptime%s  %s\n\n", dim, reset, humanDuration(time.Since(m.Started)))
 
 	fmt.Fprintf(&b, "  %s%s%s\n", dim, strings.Repeat("─", width-4), reset)
@@ -56,7 +56,8 @@ func RenderSummary(m Model, width int) string {
 
 	if m.AutoReload {
 		// Only claim this when the engine really is watching its files.
-		fmt.Fprintf(&b, "  %sedits in %s apply automatically%s\n", dim, m.DataDir, reset)
+		fmt.Fprintf(&b, "  %s%s%s\n", dim,
+			truncate("edits in "+homeShort(m.DataDir)+" apply automatically", width-4), reset)
 	}
 	if m.AutoReload {
 		fmt.Fprintf(&b, "  %s%sd%s details   %s%ss%s sync   %s%sq%s quit%s\n",
