@@ -30,6 +30,11 @@ type Manager struct {
 	mu      sync.Mutex
 	workers map[string]*worker
 	started bool
+
+	// wg covers every worker ever started, including ones retired by a
+	// reschedule. StopAll waits on it, so shutdown cannot leave a reconcile
+	// writing into a directory that is going away.
+	wg sync.WaitGroup
 }
 
 type worker struct {
@@ -115,7 +120,7 @@ func (m *Manager) Ensure(o *object.Object) error {
 			m.kick(w)
 			return nil
 		}
-		m.stopLocked(name)
+		m.retireLocked(name)
 	}
 
 	ctx, cancel := context.WithCancel(m.baseCtx)
@@ -128,6 +133,7 @@ func (m *Manager) Ensure(o *object.Object) error {
 		done:     make(chan struct{}),
 	}
 	m.workers[name] = w
+	m.wg.Add(1)
 	go m.run(ctx, w)
 
 	// Reconcile as soon as it is applied, not at the first tick.
@@ -169,14 +175,35 @@ func (m *Manager) SyncAll() {
 	}
 }
 
-// Stop shuts down one repository's worker, for when its object is deleted.
+// Stop shuts down one repository's worker and waits for it to exit.
+//
+// The wait is the point. Delete calls this and then removes the checkout, so
+// returning while a clone is still in flight would let the reconcile recreate
+// the directory moments after it was deleted.
 func (m *Manager) Stop(name string) {
 	m.mu.Lock()
-	defer m.mu.Unlock()
-	m.stopLocked(name)
+	w, ok := m.workers[name]
+	if ok {
+		delete(m.workers, name)
+	}
+	m.mu.Unlock()
+
+	if !ok {
+		return
+	}
+	// Cancel and wait off the lock: an in-flight fetch can take a while, and
+	// holding the mutex through it would block every other operation.
+	w.cancel()
+	<-w.done
 }
 
-func (m *Manager) stopLocked(name string) {
+// retireLocked cancels a worker without waiting, for the reschedule path.
+//
+// A reschedule only needs the old cadence to stop; the replacement reconciles
+// immediately anyway. Waiting here would hold the lock for the length of a
+// clone. The retired goroutine is still tracked by the WaitGroup, so StopAll
+// accounts for it.
+func (m *Manager) retireLocked(name string) {
 	w, ok := m.workers[name]
 	if !ok {
 		return
@@ -185,27 +212,23 @@ func (m *Manager) stopLocked(name string) {
 	delete(m.workers, name)
 }
 
-// StopAll shuts every worker down and waits for them, so a test or a shutdown
-// does not leave reconciles writing into a directory that is going away.
+// StopAll shuts every worker down and waits for them, so a shutdown does not
+// leave reconciles writing into a directory that is going away.
 func (m *Manager) StopAll() {
 	m.mu.Lock()
-	workers := make([]*worker, 0, len(m.workers))
 	for name, w := range m.workers {
-		workers = append(workers, w)
+		w.cancel()
 		delete(m.workers, name)
 	}
 	m.mu.Unlock()
 
-	for _, w := range workers {
-		w.cancel()
-	}
-	for _, w := range workers {
-		<-w.done
-	}
+	// Waits for retired workers too, not just the currently registered ones.
+	m.wg.Wait()
 }
 
 // run is one repository's loop.
 func (m *Manager) run(ctx context.Context, w *worker) {
+	defer m.wg.Done()
 	defer close(w.done)
 
 	var tick <-chan time.Time

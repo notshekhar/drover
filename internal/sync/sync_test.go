@@ -309,6 +309,43 @@ func TestStopRemovesWorker(t *testing.T) {
 	}
 }
 
+// Delete removes the checkout right after calling Stop, so Stop returning
+// while a clone is still in flight would let the reconcile recreate the
+// directory moments after it was deleted.
+func TestStopWaitsForTheWorkerToExit(t *testing.T) {
+	requireGit(t)
+	origin := originRepo(t)
+	m, st, dataDir := setup(t)
+	put(t, st, repoDoc("api", origin, "main", "1h"))
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	if err := m.Start(ctx); err != nil {
+		t.Fatal(err)
+	}
+	defer m.StopAll()
+
+	checkout := filepath.Join(dataDir, "repos", "api")
+	waitFor(t, "the initial clone", func() bool {
+		_, err := os.Stat(checkout)
+		return err == nil
+	})
+
+	// Queue more work, then stop. Once Stop returns, nothing may touch the
+	// directory -- which is what makes the removal below safe.
+	_ = m.SyncNow("api")
+	m.Stop("api")
+
+	if err := os.RemoveAll(checkout); err != nil {
+		t.Fatal(err)
+	}
+	// Give any goroutine that outlived Stop a chance to misbehave.
+	time.Sleep(300 * time.Millisecond)
+	if _, err := os.Stat(checkout); err == nil {
+		t.Error("the checkout came back after Stop returned; a reconcile outlived it")
+	}
+}
+
 // A server-wide --sync 0 turns the ticker off for repositories that did not
 // ask for their own cadence.
 func TestZeroDefaultDisablesTicking(t *testing.T) {
