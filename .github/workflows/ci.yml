@@ -1,0 +1,38 @@
+# Every push and PR: the tests, the formatting, and that all seven release
+# targets still compile. The last one matters because nothing else in the
+# normal loop would catch a windows-only or arm-only build break until a tag
+# was already pushed.
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: stable
+
+      - name: gofmt
+        run: |
+          unformatted="$(gofmt -l .)"
+          if [ -n "$unformatted" ]; then
+            echo "these files need gofmt:"; echo "$unformatted"; exit 1
+          fi
+
+      - run: go vet ./...
+      - run: go test -race ./...
+
+      - name: every release target compiles
+        shell: bash
+        run: |
+          set -euo pipefail
+          for t in darwin/arm64 darwin/amd64 linux/amd64 linux/arm64 windows/amd64 windows/arm64 freebsd/amd64; do
+            CGO_ENABLED=0 GOOS="${t%/*}" GOARCH="${t#*/}" go build -o /dev/null ./cmd/drover
+            echo "ok $t"
+          done

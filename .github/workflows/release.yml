@@ -1,0 +1,90 @@
+# Build the release binaries when a version tag is pushed.
+#
+# drover has no cgo — pgx, go-sql-driver/mysql and yaml.v3 are all pure Go —
+# so every target cross-compiles from one runner. That is worth stating,
+# because it removes the three things that usually complicate a Go release:
+#
+#   * no per-OS runners, so the matrix is a loop instead of a job graph
+#   * no glibc/musl split, so Alpine runs the same asset as Debian
+#   * windows actually works, rather than being a broken install nobody tests
+#
+# Assets are named the way the installers expect: `drover-<os>-<arch>.tar.gz`
+# holding `<os>-<arch>/drover`, plus a `.sha256` beside each one. The directory
+# inside the tarball is what lets install.sh swap a whole directory into place
+# atomically rather than a bare file.
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: stable
+
+      # The tag is the release, so a broken tree must not become one.
+      - name: test
+        run: go test ./...
+
+      - name: build every target
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="${GITHUB_REF_NAME#v}"
+
+          targets="
+            darwin-arm64:darwin:arm64
+            darwin-x64:darwin:amd64
+            linux-x64:linux:amd64
+            linux-arm64:linux:arm64
+            windows-x64:windows:amd64
+            windows-arm64:windows:arm64
+            freebsd-x64:freebsd:amd64
+          "
+
+          mkdir -p dist
+          for entry in $targets; do
+            target="${entry%%:*}"; rest="${entry#*:}"
+            goos="${rest%%:*}"; goarch="${rest#*:}"
+
+            exe="drover"
+            [ "$goos" = "windows" ] && exe="drover.exe"
+
+            mkdir -p "dist/$target"
+            # -trimpath keeps build paths out of the binary; -s -w drops the
+            # symbol table and DWARF, which halves the download.
+            CGO_ENABLED=0 GOOS="$goos" GOARCH="$goarch" \
+              go build -trimpath \
+                -ldflags "-s -w -X main.Version=$version" \
+                -o "dist/$target/$exe" ./cmd/drover
+
+            tar -C dist -czf "dist/drover-$target.tar.gz" "$target"
+            ( cd dist && sha256sum "drover-$target.tar.gz" > "drover-$target.tar.gz.sha256" )
+            echo "built $target"
+          done
+          ls -la dist/*.tar.gz
+
+      # The installers read the version out of the binary to decide whether an
+      # install is up to date, so a build that forgot the ldflag would make
+      # every future run reinstall. Cheap to check here.
+      - name: the version is stamped
+        run: |
+          set -euo pipefail
+          got="$(./dist/linux-x64/drover version)"
+          want="drover ${GITHUB_REF_NAME#v}"
+          [ "$got" = "$want" ] || { echo "version is '$got', want '$want'"; exit 1; }
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/*.tar.gz
+            dist/*.tar.gz.sha256
+          generate_release_notes: true
