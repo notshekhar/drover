@@ -113,10 +113,16 @@ func TestStartReconcilesImmediately(t *testing.T) {
 	}
 	defer m.StopAll()
 
-	waitFor(t, "the checkout to appear", func() bool {
-		_, err := os.Stat(filepath.Join(dataDir, "repos", "api", "README.md"))
-		return err == nil
+	// Wait on the status, not on the files: a clone writes its content before
+	// the reconcile finishes recording what it did, so a present README says
+	// nothing about whether the attempt completed.
+	waitFor(t, "the reconcile to finish", func() bool {
+		s, err := st.GetStatus(object.KindRepository, "api")
+		return err == nil && s.Phase == store.PhaseReady
 	})
+	if _, err := os.Stat(filepath.Join(dataDir, "repos", "api", "README.md")); err != nil {
+		t.Fatalf("the checkout has no content: %v", err)
+	}
 
 	st2, err := st.GetStatus(object.KindRepository, "api")
 	if err != nil {
@@ -168,7 +174,7 @@ func TestFailureIsRecordedAndRetried(t *testing.T) {
 func TestOneFailureDoesNotBlockOthers(t *testing.T) {
 	requireGit(t)
 	good := originRepo(t)
-	m, st, dataDir := setup(t)
+	m, st, _ := setup(t)
 	put(t, st, repoDoc("broken", filepath.Join(t.TempDir(), "nope"), "main", ""))
 	put(t, st, repoDoc("good", good, "main", ""))
 
@@ -180,8 +186,8 @@ func TestOneFailureDoesNotBlockOthers(t *testing.T) {
 	defer m.StopAll()
 
 	waitFor(t, "the healthy repository to clone", func() bool {
-		_, err := os.Stat(filepath.Join(dataDir, "repos", "good", "README.md"))
-		return err == nil
+		s, err := st.GetStatus(object.KindRepository, "good")
+		return err == nil && s.Phase == store.PhaseReady
 	})
 	waitFor(t, "the broken repository to be marked failed", func() bool {
 		s, err := st.GetStatus(object.KindRepository, "broken")
@@ -207,9 +213,12 @@ func TestNeverDoesNotTickButSyncsOnDemand(t *testing.T) {
 	// Applying still reconciles once -- "never" governs the ticker, not the
 	// initial clone, or the checkout would never exist at all.
 	waitFor(t, "the initial clone", func() bool {
-		_, err := os.Stat(filepath.Join(dataDir, "repos", "api", "README.md"))
-		return err == nil
+		s, err := st.GetStatus(object.KindRepository, "api")
+		return err == nil && s.Phase == store.PhaseReady
 	})
+	if _, err := os.Stat(filepath.Join(dataDir, "repos", "api", "README.md")); err != nil {
+		t.Fatalf("the checkout has no content: %v", err)
+	}
 
 	m.mu.Lock()
 	w := m.workers["api"]
@@ -327,8 +336,8 @@ func TestStopWaitsForTheWorkerToExit(t *testing.T) {
 
 	checkout := filepath.Join(dataDir, "repos", "api")
 	waitFor(t, "the initial clone", func() bool {
-		_, err := os.Stat(checkout)
-		return err == nil
+		s, err := st.GetStatus(object.KindRepository, "api")
+		return err == nil && s.Phase == store.PhaseReady
 	})
 
 	// Queue more work, then stop. Once Stop returns, nothing may touch the
