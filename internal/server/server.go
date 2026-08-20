@@ -15,6 +15,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"gopkg.in/yaml.v3"
@@ -29,7 +30,7 @@ import (
 	"github.com/notshekhar/drover/internal/repo"
 	"github.com/notshekhar/drover/internal/sqldb"
 	"github.com/notshekhar/drover/internal/store"
-	"github.com/notshekhar/drover/internal/sync"
+	syncmgr "github.com/notshekhar/drover/internal/sync"
 )
 
 // Options configure a server.
@@ -57,13 +58,18 @@ type Server struct {
 	opts  Options
 	store *store.Store
 	repo  *repo.Reconciler
-	sync  *sync.Manager
+	sync  *syncmgr.Manager
 	http  *httpreq.Executor
 	sql   *sqldb.Pool
 	files *files.Root
 	mux   *http.ServeMux
 
 	started time.Time
+
+	// httpSrv is kept so shutdown can drain in-flight requests instead of
+	// closing the listener out from under them.
+	mu      sync.Mutex
+	httpSrv *http.Server
 }
 
 // New builds a server over the data directory.
@@ -86,7 +92,7 @@ func New(opts Options) (*Server, error) {
 		started: time.Now(),
 	}
 	if !opts.NoSync {
-		s.sync = sync.New(sync.Options{
+		s.sync = syncmgr.New(syncmgr.Options{
 			Store:   st,
 			Repo:    s.repo,
 			Default: opts.Sync,
@@ -348,13 +354,51 @@ func isAddrInUse(err error) bool {
 	return errors.Is(err, syscallEADDRINUSE) || strings.Contains(err.Error(), "address already in use")
 }
 
-// Serve runs until the listener closes.
+// Serve runs until the server is shut down. It returns nil on a graceful
+// stop, matching http.Server's own convention of reporting that as
+// ErrServerClosed rather than a failure.
 func (s *Server) Serve(ln net.Listener) error {
 	srv := &http.Server{
 		Handler:           s.mux,
 		ReadHeaderTimeout: 10 * time.Second,
 	}
-	return srv.Serve(ln)
+	s.mu.Lock()
+	s.httpSrv = srv
+	s.mu.Unlock()
+
+	err := srv.Serve(ln)
+	if errors.Is(err, http.ErrServerClosed) {
+		return nil
+	}
+	return err
+}
+
+// Shutdown stops accepting connections and waits for in-flight requests to
+// finish, then releases everything the engine holds.
+//
+// The wait matters: a tool call can be a large grep or an HTTP request to a
+// slow API, and closing the listener under it would hand the agent a broken
+// pipe instead of an answer. If the context expires first the remaining
+// connections are closed anyway, because a shutdown that can be blocked
+// forever by one hung request is not a shutdown.
+func (s *Server) Shutdown(ctx context.Context) error {
+	s.mu.Lock()
+	srv := s.httpSrv
+	s.mu.Unlock()
+
+	var err error
+	if srv != nil {
+		err = srv.Shutdown(ctx)
+		if errors.Is(err, context.DeadlineExceeded) {
+			s.logf("some requests did not finish in time; closing them")
+			_ = srv.Close()
+		}
+	}
+
+	// Workers and database connections come after the listener, so nothing
+	// new can arrive while they are being torn down.
+	s.StopSync()
+	return err
 }
 
 // --- handlers ---

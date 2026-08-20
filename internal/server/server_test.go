@@ -4,6 +4,8 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -630,4 +632,111 @@ spec:
 	if n := atomic.LoadInt32(&reloads); n > 2 {
 		t.Errorf("%d reloads for one batch of edits; the settle delay is not working", n)
 	}
+}
+
+// Shutdown must let work in flight finish. A tool call can be a large grep or
+// a request to a slow API, and cutting one off hands the agent a broken pipe
+// instead of an answer.
+func TestShutdownDrainsInFlightRequests(t *testing.T) {
+	dir := t.TempDir()
+	s, err := New(Options{DataDir: dir, Version: "test", NoSync: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// A handler that is deliberately slow, standing in for a big grep.
+	started := make(chan struct{})
+	mux := http.NewServeMux()
+	mux.HandleFunc("/slow", func(w http.ResponseWriter, r *http.Request) {
+		close(started)
+		time.Sleep(600 * time.Millisecond)
+		_, _ = w.Write([]byte("finished"))
+	})
+	s.mux.Handle("/slow", mux)
+
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	serveDone := make(chan error, 1)
+	go func() { serveDone <- s.Serve(ln) }()
+
+	type result struct {
+		body string
+		err  error
+	}
+	got := make(chan result, 1)
+	go func() {
+		resp, err := http.Get("http://" + ln.Addr().String() + "/slow")
+		if err != nil {
+			got <- result{err: err}
+			return
+		}
+		defer resp.Body.Close()
+		body, err := io.ReadAll(resp.Body)
+		got <- result{body: string(body), err: err}
+	}()
+
+	<-started // the request is in the handler; now pull the rug
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := s.Shutdown(ctx); err != nil {
+		t.Fatalf("shutdown: %v", err)
+	}
+
+	select {
+	case r := <-got:
+		if r.err != nil {
+			t.Fatalf("the in-flight request was cut off: %v", r.err)
+		}
+		if r.body != "finished" {
+			t.Errorf("body = %q, want the handler's full response", r.body)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("the in-flight request never completed")
+	}
+
+	// A graceful stop is not a failure.
+	select {
+	case err := <-serveDone:
+		if err != nil {
+			t.Errorf("Serve reported %v on a graceful shutdown, want nil", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("Serve did not return after shutdown")
+	}
+}
+
+// After a shutdown the port must actually be free, or restarting walks to the
+// next one and every configured MCP url is suddenly wrong.
+func TestShutdownReleasesTheListener(t *testing.T) {
+	dir := t.TempDir()
+	s, err := New(Options{DataDir: dir, Version: "test", NoSync: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	addr := ln.Addr().String()
+	go s.Serve(ln)
+
+	// Make sure it is really up before stopping it.
+	if _, err := http.Get("http://" + addr + api.Prefix + "/status"); err != nil {
+		t.Fatal(err)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := s.Shutdown(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	again, err := net.Listen("tcp", addr)
+	if err != nil {
+		t.Fatalf("the port is still held after shutdown: %v", err)
+	}
+	again.Close()
 }

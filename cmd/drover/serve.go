@@ -2,19 +2,26 @@ package main
 
 import (
 	"context"
-	"errors"
 	"flag"
 	"fmt"
 	"io"
-	"net"
 	"os"
 	"os/signal"
 	"syscall"
+	"time"
 
 	"github.com/notshekhar/drover/internal/config"
 	"github.com/notshekhar/drover/internal/server"
 	"github.com/notshekhar/drover/internal/tui"
 )
+
+// shutdownGrace is how long in-flight requests get to finish.
+//
+// A tool call can be a large grep or a request to a slow API, and cutting one
+// off hands the agent a broken pipe instead of an answer. Ten seconds is long
+// enough for anything reasonable and short enough that quitting still feels
+// immediate.
+const shutdownGrace = 10 * time.Second
 
 func cmdServe(args []string) error {
 	fs := flag.NewFlagSet("serve", flag.ContinueOnError)
@@ -93,7 +100,6 @@ func cmdServe(args []string) error {
 	if err := srv.StartSync(ctx); err != nil {
 		return err
 	}
-	defer srv.StopSync()
 
 	// The health gate decides whether a sql tool is offered at all, so it runs
 	// at startup rather than at the first query. In the background, because a
@@ -104,11 +110,6 @@ func cmdServe(args []string) error {
 	if err != nil {
 		return err
 	}
-	go func() {
-		<-ctx.Done()
-		ln.Close()
-	}()
-
 	// One sender, one closed channel, any number of waiters.
 	//
 	// This was a chan error with two receivers: the goroutine that took the
@@ -120,13 +121,25 @@ func cmdServe(args []string) error {
 	var serveErr error
 	serveDone := make(chan struct{})
 	go func() {
-		err := srv.Serve(ln)
-		if err != nil && errors.Is(err, net.ErrClosed) {
-			err = nil
-		}
-		serveErr = err
+		serveErr = srv.Serve(ln)
 		close(serveDone)
 	}()
+
+	// shutdown is the only way out of this function, so there is one place
+	// that knows how to stop cleanly: stop accepting, let in-flight requests
+	// finish, then release the workers and the database connections.
+	shutdown := func(reason string) error {
+		fmt.Fprintf(os.Stderr, "\rdrover: %s, finishing in-flight requests…\n", reason)
+
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), shutdownGrace)
+		defer cancel()
+		if err := srv.Shutdown(shutdownCtx); err != nil {
+			fmt.Fprintf(os.Stderr, "drover: shutdown: %v\n", err)
+		}
+		<-serveDone
+		fmt.Fprintln(os.Stderr, "drover stopped")
+		return serveErr
+	}
 
 	if !dashboard {
 		// No screen to show it on, so the watcher reports through the log.
@@ -136,9 +149,15 @@ func cmdServe(args []string) error {
 		fmt.Fprintf(os.Stderr, "  MCP: http://%s%s\n", ln.Addr(), server.MCPPath)
 		fmt.Fprintf(os.Stderr, "  add it with: claude mcp add --transport http drover http://%s%s\n",
 			ln.Addr(), server.MCPPath)
-		<-serveDone
-		fmt.Fprintln(os.Stderr, "drover stopped")
-		return serveErr
+		select {
+		case <-ctx.Done():
+			return shutdown("interrupted")
+		case <-serveDone:
+			// The listener died on its own; still let go of everything else.
+			srv.StopSync()
+			fmt.Fprintln(os.Stderr, "drover stopped")
+			return serveErr
+		}
 	}
 
 	// Quitting the dashboard stops the engine: it is the foreground process
@@ -167,12 +186,13 @@ func cmdServe(args []string) error {
 		// The screen could not be set up (no raw mode, say). That is cosmetic,
 		// so fall back to serving rather than refusing to run at all.
 		fmt.Fprintf(os.Stderr, "dashboard unavailable (%v); serving on http://%s\n", err, ln.Addr())
-		<-serveDone
-		return serveErr
+		<-ctx.Done()
+		return shutdown("interrupted")
 	}
 
-	ln.Close()
-	<-serveDone
-	fmt.Fprintln(os.Stderr, "drover stopped")
-	return serveErr
+	reason := "shutting down"
+	if ctx.Err() != nil {
+		reason = "interrupted"
+	}
+	return shutdown(reason)
 }
