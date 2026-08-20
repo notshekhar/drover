@@ -88,6 +88,27 @@ no restart. **s** refreshes every repository now.
 including one on another machine (`--server`). `drover serve --no-tui` logs
 plainly instead, which is what you want under systemd or in CI.
 
+## Adding things
+
+The first `drover serve` writes **`~/.drover/docs.md`** — a full reference for
+every kind, written to be handed to an agent:
+
+> read ~/.drover/docs.md and add our three repos and the billing API
+
+Any `*.yaml` you or your agent drops in `~/.drover/` is applied on startup and
+on reload. Nothing to register, no list to maintain.
+
+```
+~/.drover/
+  docs.md          the reference
+  config.yaml      drover's own settings — not an object file
+  repos.yaml       anything else here gets applied
+  github-api.yaml
+  databases.yaml
+```
+
+Or keep the files anywhere and point at them with `drover apply -f`.
+
 Tell it about a repository:
 
 ```yaml

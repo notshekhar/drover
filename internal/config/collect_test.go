@@ -139,3 +139,58 @@ func TestCollectAllReportsMissingPath(t *testing.T) {
 		t.Fatal("test setup is wrong: the path exists")
 	}
 }
+
+// Dropping a yaml file in ~/.drover is the whole workflow the reference
+// describes, so the scan has to find it -- and has to ignore drover's own
+// config and internal directories.
+func TestDropInFiles(t *testing.T) {
+	dir := t.TempDir()
+
+	write(t, filepath.Join(dir, "repos.yaml"), repoYAML)
+	write(t, filepath.Join(dir, "github-api.yml"), repoYAML)
+	write(t, filepath.Join(dir, "config.yaml"), "listen: 127.0.0.1:7432\n")
+	write(t, filepath.Join(dir, "docs.md"), "# docs\n")
+	write(t, filepath.Join(dir, ".hidden.yaml"), repoYAML)
+	write(t, filepath.Join(dir, "objects", "Repository", "api.yaml"), repoYAML)
+	write(t, filepath.Join(dir, "repos", "api", "thing.yaml"), repoYAML)
+
+	got, err := DropInFiles(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	want := []string{filepath.Join(dir, "github-api.yml"), filepath.Join(dir, "repos.yaml")}
+	if len(got) != len(want) {
+		t.Fatalf("got %v, want %v", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Errorf("got %v, want %v", got, want)
+		}
+	}
+}
+
+// config.yaml is drover's own settings. Scanning it in as an object would
+// fail every single boot with "kind is required".
+func TestDropInFilesSkipsConfig(t *testing.T) {
+	dir := t.TempDir()
+	write(t, filepath.Join(dir, "config.yaml"), "listen: 127.0.0.1:7432\n")
+
+	got, err := DropInFiles(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 0 {
+		t.Errorf("got %v, want nothing -- config.yaml is not an object file", got)
+	}
+}
+
+func TestDropInFilesOnMissingDir(t *testing.T) {
+	got, err := DropInFiles(filepath.Join(t.TempDir(), "nope"))
+	if err != nil {
+		t.Fatalf("a missing data dir must not be an error: %v", err)
+	}
+	if len(got) != 0 {
+		t.Errorf("got %v", got)
+	}
+}

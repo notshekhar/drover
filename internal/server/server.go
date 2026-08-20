@@ -11,6 +11,7 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"path/filepath"
 	"sort"
 	"strconv"
 	"strings"
@@ -20,6 +21,7 @@ import (
 
 	"github.com/notshekhar/drover/internal/api"
 	"github.com/notshekhar/drover/internal/config"
+	"github.com/notshekhar/drover/internal/docs"
 	"github.com/notshekhar/drover/internal/files"
 	"github.com/notshekhar/drover/internal/httpreq"
 	"github.com/notshekhar/drover/internal/mcp"
@@ -153,12 +155,20 @@ func (s *Server) Bootstrap(cfg *config.Config) error {
 	}
 	s.logf("loaded %d object(s) from %s", len(existing), s.store.Dir())
 
-	if len(cfg.Apply) == 0 {
-		return nil
+	// Write the reference before anything else, so a first run leaves a
+	// data directory that explains itself.
+	if written, err := docs.Ensure(s.opts.DataDir); err != nil {
+		s.logf("could not write %s: %v", docs.Path(s.opts.DataDir), err)
+	} else if written {
+		s.logf("wrote %s — point an agent at it to add repositories, APIs and databases", docs.Path(s.opts.DataDir))
 	}
-	files, err := config.CollectAll(cfg.Apply)
+
+	files, err := s.sourceFiles(cfg)
 	if err != nil {
-		return fmt.Errorf("apply: %w (fix the path, or drop it with `drover forget <path>`)", err)
+		return err
+	}
+	if len(files) == 0 {
+		return nil
 	}
 
 	batch, err := s.readBatch(files)
@@ -234,6 +244,44 @@ func (s *Server) CheckSQLHealth(ctx context.Context) {
 		}
 		s.logf("sqlconnection %s: healthy", name)
 	}
+}
+
+// sourceFiles is everything to apply at startup: the yaml dropped in the data
+// directory, then the paths the config lists.
+//
+// Drop-ins come first so that a file someone (or their agent) put in
+// ~/.drover is applied even on a machine whose config has no apply: list at
+// all, which is the state after a fresh install.
+func (s *Server) sourceFiles(cfg *config.Config) ([]string, error) {
+	dropIns, err := config.DropInFiles(s.opts.DataDir)
+	if err != nil {
+		return nil, fmt.Errorf("read %s: %w", s.opts.DataDir, err)
+	}
+
+	var configured []string
+	if len(cfg.Apply) > 0 {
+		configured, err = config.CollectAll(cfg.Apply)
+		if err != nil {
+			return nil, fmt.Errorf("apply: %w (fix the path, or drop it with `drover forget <path>`)", err)
+		}
+	}
+
+	// A file reached both ways is one file; applying it twice would trip the
+	// duplicate-name check against itself.
+	seen := map[string]bool{}
+	var out []string
+	for _, f := range append(dropIns, configured...) {
+		key := f
+		if resolved, err := filepath.EvalSymlinks(f); err == nil {
+			key = resolved
+		}
+		if seen[key] {
+			continue
+		}
+		seen[key] = true
+		out = append(out, f)
+	}
+	return out, nil
 }
 
 // readBatch parses every file into one batch. Bootstrap and the dashboard's

@@ -90,3 +90,40 @@ func IsYAML(name string) bool {
 	ext := strings.ToLower(filepath.Ext(name))
 	return ext == ".yaml" || ext == ".yml"
 }
+
+// DropInFiles are the object files sitting directly in the data directory.
+//
+// This is the path someone takes when they tell an agent "read ~/.drover/docs.md
+// and add our repositories": the agent writes a yaml file there and it is
+// applied, with nothing to register and no apply: entry to maintain.
+//
+// Only the top level is scanned, so drover's own objects/, repos/ and status/
+// directories are never mistaken for input.
+func DropInFiles(dataDir string) ([]string, error) {
+	entries, err := os.ReadDir(dataDir)
+	if os.IsNotExist(err) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+
+	var out []string
+	for _, e := range entries {
+		if e.IsDir() || strings.HasPrefix(e.Name(), ".") || !IsYAML(e.Name()) {
+			continue
+		}
+		// config.yaml is drover's own settings, not an object document.
+		// Scanning it in would fail every boot with "kind is required".
+		if e.Name() == FileName {
+			continue
+		}
+		abs, err := filepath.Abs(filepath.Join(dataDir, e.Name()))
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, abs)
+	}
+	sort.Strings(out)
+	return out, nil
+}

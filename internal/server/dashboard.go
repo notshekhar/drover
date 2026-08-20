@@ -146,13 +146,15 @@ func (s *Server) Reload(cfgPath string) (string, *config.Config, error) {
 		return "", nil, fmt.Errorf("config: %w", err)
 	}
 
-	if len(fresh.Apply) == 0 {
-		return "nothing to reload: no paths in apply:", fresh, nil
-	}
-
-	files, err := config.CollectAll(fresh.Apply)
+	// Same sources as a startup apply: the yaml in the data directory plus
+	// the config's paths. A reload that saw less than a restart would be a
+	// trap.
+	files, err := s.sourceFiles(fresh)
 	if err != nil {
 		return "", nil, err
+	}
+	if len(files) == 0 {
+		return fmt.Sprintf("nothing to reload: no yaml in %s and no paths in apply:", s.opts.DataDir), fresh, nil
 	}
 
 	batch, err := s.readBatch(files)

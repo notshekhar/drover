@@ -415,3 +415,90 @@ func TestListenWalksPastABusyPort(t *testing.T) {
 		t.Fatal("both listeners claim the same address")
 	}
 }
+
+// A first start must leave a data directory that explains itself, so someone
+// can point an agent at it without having read anything first.
+func TestBootstrapWritesTheReference(t *testing.T) {
+	dir := t.TempDir()
+	s, err := New(Options{DataDir: dir, Version: "test", NoSync: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Bootstrap(&config.Config{}); err != nil {
+		t.Fatal(err)
+	}
+
+	body, err := os.ReadFile(filepath.Join(dir, "docs.md"))
+	if err != nil {
+		t.Fatalf("docs.md was not written: %v", err)
+	}
+	if !strings.Contains(string(body), "kind: Repository") {
+		t.Error("docs.md does not look like the reference")
+	}
+}
+
+// The workflow the reference describes: write a yaml into ~/.drover and it is
+// applied, with no apply: entry to maintain.
+func TestBootstrapAppliesDropInFiles(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "repos.yaml"), []byte(repoDoc), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	s, err := New(Options{DataDir: dir, Version: "test", NoSync: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// An empty config: nothing registered anywhere, which is the state right
+	// after a fresh install.
+	if err := s.Bootstrap(&config.Config{}); err != nil {
+		t.Fatal(err)
+	}
+
+	objs, err := s.Store().List(object.KindRepository)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(objs) != 1 || objs[0].Metadata.Name != "api" {
+		t.Fatalf("the dropped-in file was not applied: %+v", objs)
+	}
+}
+
+// drover's own config.yaml lives in the same directory. Reading it as an
+// object would fail every boot.
+func TestBootstrapIgnoresItsOwnConfig(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "config.yaml"),
+		[]byte("listen: 127.0.0.1:7432\napply: []\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	s, err := New(Options{DataDir: dir, Version: "test", NoSync: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Bootstrap(&config.Config{}); err != nil {
+		t.Fatalf("config.yaml was read as an object: %v", err)
+	}
+}
+
+// A file reached as both a drop-in and an apply: path is one file. Applying
+// it twice would trip the duplicate-name check against itself.
+func TestBootstrapDedupesDropInAndApplyPath(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "repos.yaml")
+	if err := os.WriteFile(path, []byte(repoDoc), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	s, err := New(Options{DataDir: dir, Version: "test", NoSync: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Bootstrap(&config.Config{Apply: []string{path}}); err != nil {
+		t.Fatalf("the same file counted twice: %v", err)
+	}
+}
