@@ -27,11 +27,21 @@ irm https://raw.githubusercontent.com/notshekhar/drover/main/install.ps1 | iex
 One static binary, ~4.5 MB. No runtime, no cgo, so the same Linux asset runs on
 Alpine and Debian alike. macOS, Linux, Windows and FreeBSD; x64 and arm64.
 
+Upgrade later with:
+
+```bash
+drover upgrade
+```
+
 <details>
 <summary>Other ways</summary>
 
 ```bash
+# see whether a newer release exists, without installing it
+drover upgrade --check
+
 # a specific release
+drover upgrade --version v0.4.0
 curl -fsSL .../install.sh | bash -s -- --version v0.1.0
 
 # from source
@@ -327,6 +337,7 @@ drover query <name> "SELECT ..."   query a SQLConnection
 drover health <name>               re-run a health gate
 drover mcp                         stdio MCP bridge
 drover forget <path>               drop a path from the apply list
+drover upgrade                     install the latest release
 ```
 
 `--server <url>` points any client command at an engine elsewhere.

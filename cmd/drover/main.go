@@ -47,6 +47,8 @@ func run(args []string) error {
 		return cmdHealth(rest)
 	case "forget":
 		return cmdForget(rest)
+	case "upgrade", "update", "self-update":
+		return cmdUpgrade(rest)
 	case "version", "--version", "-v":
 		fmt.Println("drover " + Version)
 		return nil
@@ -74,6 +76,7 @@ Usage:
   drover health <name>              re-run a SQLConnection's health gate
   drover mcp                        bridge an agent's stdio to the engine (MCP)
   drover forget <path>              drop a path from the config apply list
+  drover upgrade                    install the latest release
   drover version
   drover help
 

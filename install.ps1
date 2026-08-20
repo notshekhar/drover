@@ -223,6 +223,8 @@ if (Test-Path $exe) {
     Remove-Item $old -Force -ErrorAction SilentlyContinue
 }
 Move-Item $srcExe $exe -Force
+# `drover upgrade` looks for this before replacing the binary.
+Set-Content -Path (Join-Path $BinHome ".install-method") -Value "binary" -ErrorAction SilentlyContinue
 Remove-Item $tmpRoot -Recurse -Force -ErrorAction SilentlyContinue
 
 # ── PATH ──────────────────────────────────────────────────────────────────

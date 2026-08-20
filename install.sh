@@ -419,6 +419,11 @@ do_install() {
   trap - EXIT
   rm -rf "$scratch" 2>/dev/null || true
 
+  # `drover upgrade` looks for this before replacing the binary: without it,
+  # drover arrived some other way (go install, a package manager) and
+  # upgrading in place would leave two copies with no clear owner.
+  printf "binary\n" > "$BIN_HOME/.install-method" 2>/dev/null || true
+
   link_globally
   smoke_test
   finish_message "$latest"

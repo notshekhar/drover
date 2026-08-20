@@ -436,6 +436,19 @@ file, none that POSTs, and none that writes to a database.
 
 ---
 
+## Keeping drover current
+
+```bash
+drover upgrade           # install the latest release
+drover upgrade --check   # just look
+```
+
+It re-runs the published installer, which verifies the download's checksum
+before replacing anything. Your data here is never touched. Restart any
+running `drover serve` afterwards to pick up the new binary.
+
+---
+
 ## If something does not apply
 
 drover refuses to start rather than run with a file it could not understand,
