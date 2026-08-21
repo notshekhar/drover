@@ -312,8 +312,8 @@ Tools an agent gets:
 |---|---|
 | `ls` | list a directory; no path lists the repositories |
 | `read` | read a file, numbered lines, offset/limit windows |
-| `grep` | RE2 search, with `path` and `include` filters |
-| `find` | glob on the name, or on the whole path when it has a slash |
+| `grep` | RE2 search, with `path` and `include` filters; skips `node_modules`, `vendor`, `dist` and the rest |
+| `find` | glob on the name, or on the whole path when it has a slash; skips the same directories |
 | `git` | history: `log`, `show`, `diff`, `blame`, `search`, `file`, `branches`, `tags`, `contributors`, `status` |
 | `lsp` | code by meaning: `definition`, `references`, `hover`, `implementations`, `document_symbols`, `workspace_symbols`, `incoming_calls`, `outgoing_calls`, `diagnostics`, `servers` |
 | `api_list` | find a request by fuzzy search over everything it says; also lists the environments |
@@ -325,6 +325,16 @@ Tools an agent gets:
 become entries `api_list` returns, the databases are listed inside
 `sql_query`'s own description, and ten history operations sit behind `git`'s
 `operation` argument rather than becoming ten more tools.
+
+Search skips what nobody asked about. A real checkout is overwhelmingly
+dependencies and build output — on one repository we measured, 143,690 of
+147,852 files were `node_modules` — so `grep` and `find` walk past
+`node_modules`, `vendor`, `dist`, `build`, `target`, `.venv` and the rest.
+That is not only speed. The result cap used to fill with vendored copies and
+minified bundles before the walk ever reached the source: the same search that
+returned 140 dependency hits out of 200, topped by a `.js.map`, now returns the
+project's own code. Point `path` at one of those directories and it is searched
+normally — the list is about what a walk wanders into, not what it is aimed at.
 
 `grep` and `read` see the tree as it is now; `git` sees how it got that way —
 who changed a line, when a function first appeared, what a file looked like

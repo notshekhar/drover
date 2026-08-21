@@ -5,6 +5,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -319,5 +320,108 @@ func TestGitDoesNotPrompt(t *testing.T) {
 		}
 	case <-time.After(30 * time.Second):
 		t.Fatal("git hung, most likely on a credential prompt")
+	}
+}
+
+// A tick that finds nothing new must not rewrite the worktree.
+//
+// Asserted on the git commands actually run, because that is the contract:
+// `checkout -B` plus `reset --hard` rewrites the index and walks the tree,
+// and doing it on every refresh interval of every repository, forever, to
+// arrive at the tree already on disk is the cost this avoids.
+func TestReconcileSkipsResetWhenUnchanged(t *testing.T) {
+	requireGit(t)
+	origin := originRepo(t, "main")
+	r := newReconciler(t)
+	spec := &object.RepositorySpec{URL: origin, Branch: "main"}
+
+	first, err := r.Reconcile(context.Background(), "api", spec)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !first.Cloned {
+		t.Fatal("first reconcile did not clone")
+	}
+
+	log := recordGit(t, r)
+	second, err := r.Reconcile(context.Background(), "api", spec)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if second.Updated {
+		t.Error("a reconcile with nothing to fetch reported an update")
+	}
+	if second.Commit != first.Commit {
+		t.Errorf("commit moved from %s to %s with no new upstream work", first.Commit, second.Commit)
+	}
+	for _, line := range readLines(t, log) {
+		if strings.HasPrefix(line, "checkout") || strings.HasPrefix(line, "reset") {
+			t.Errorf("ran %q on a tick with nothing to fetch", line)
+		}
+	}
+}
+
+// recordGit points the reconciler at a wrapper that appends each invocation's
+// arguments to a file, and returns that file's path.
+func recordGit(t *testing.T, r *Reconciler) string {
+	t.Helper()
+	if runtime.GOOS == "windows" {
+		t.Skip("the recorder is a shell script")
+	}
+	dir := t.TempDir()
+	log := filepath.Join(dir, "calls.log")
+	wrapper := filepath.Join(dir, "git")
+	script := "#!/bin/sh\nprintf '%s\\n' \"$*\" >> " + log + "\nexec " + r.Git + " \"$@\"\n"
+	if err := os.WriteFile(wrapper, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	r.Git = wrapper
+	return log
+}
+
+func readLines(t *testing.T, path string) []string {
+	t.Helper()
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("no git calls were recorded: %v", err)
+	}
+	var out []string
+	for _, line := range strings.Split(string(data), "\n") {
+		if strings.TrimSpace(line) != "" {
+			out = append(out, line)
+		}
+	}
+	return out
+}
+
+// The skip must not swallow a local edit: this tree is a mirror, so an
+// unchanged remote is not on its own a reason to leave the worktree alone.
+func TestReconcileResetsDespiteUnchangedRemote(t *testing.T) {
+	requireGit(t)
+	origin := originRepo(t, "main")
+	r := newReconciler(t)
+	spec := &object.RepositorySpec{URL: origin, Branch: "main"}
+
+	if _, err := r.Reconcile(context.Background(), "api", spec); err != nil {
+		t.Fatal(err)
+	}
+	readme := filepath.Join(r.Path("api"), "README.md")
+	want, err := os.ReadFile(readme)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(readme, []byte("locally edited\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := r.Reconcile(context.Background(), "api", spec); err != nil {
+		t.Fatal(err)
+	}
+	got, err := os.ReadFile(readme)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(got) != string(want) {
+		t.Errorf("README = %q, want the remote's content back", got)
 	}
 }

@@ -420,8 +420,8 @@ The agent then has:
 |---|---|
 | `ls` | list a directory; no path lists the repositories |
 | `read` | read a file, with line numbers |
-| `grep` | regular-expression search across the checkouts |
-| `find` | find files by name or path pattern |
+| `grep` | regular-expression search across the checkouts, skipping dependency and build directories |
+| `find` | find files by name or path pattern, skipping dependency and build directories |
 | `git` | history: `log`, `show`, `diff`, `blame`, `search`, `file`, `branches`, `tags`, `contributors`, `status` |
 | `lsp` | code by meaning: `definition`, `references`, `hover`, `implementations`, `document_symbols`, `workspace_symbols`, `incoming_calls`, `outgoing_calls`, `diagnostics`, `servers` |
 | `api_list` | find a request, with a fuzzy search over everything a request says; also lists the environments |

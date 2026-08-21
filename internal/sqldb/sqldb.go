@@ -137,6 +137,18 @@ func (p *Pool) Forget(name string) {
 	}
 }
 
+// Pooled reports whether a connection is currently open for name.
+//
+// Exported for the tests that pin when the pool is dropped: a re-applied or
+// deleted SQLConnection must not go on answering from the connection its
+// previous document opened.
+func (p *Pool) Pooled(name string) bool {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	_, ok := p.dbs[name]
+	return ok
+}
+
 // HealthCheck runs spec.health.
 //
 // This is the gate: no health query, or one that fails, means no sql tool is

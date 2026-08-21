@@ -300,6 +300,8 @@ func (m *Manager) reconcile(ctx context.Context, name string) {
 	switch {
 	case res.Cloned:
 		m.logf("repository %s: cloned %s at %s", name, spec.Branch, short(res.Commit))
+	case res.Updated:
+		m.logf("repository %s: updated %s to %s", name, spec.Branch, short(res.Commit))
 	default:
 		m.logf("repository %s: up to date at %s", name, short(res.Commit))
 	}

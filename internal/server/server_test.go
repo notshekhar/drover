@@ -772,3 +772,61 @@ func TestLSPServersOperation(t *testing.T) {
 		}
 	}
 }
+
+// A re-applied or deleted SQLConnection must not go on answering from the
+// connection its previous document opened.
+//
+// The failure this pins is quiet and nasty: rotate a database url, apply,
+// and every query still runs against the old host while looking like the new
+// credentials work.
+func TestSQLConnectionPoolIsDroppedOnChange(t *testing.T) {
+	s, _ := newServer(t)
+	doc1 := `apiVersion: drover/v1
+kind: SQLConnection
+metadata:
+  name: prod
+spec:
+  provider: postgres
+  url: postgres://user@old.example.invalid:5432/app
+  health: SELECT 1
+`
+	if rec, _ := apply(t, s, doc("/work/sql.yaml", doc1)); rec.Code != http.StatusOK {
+		t.Fatalf("apply: status %d: %s", rec.Code, rec.Body)
+	}
+
+	spec := &object.SQLConnectionSpec{
+		Provider: "postgres",
+		URL:      "postgres://user@old.example.invalid:5432/app",
+		Health:   "SELECT 1",
+	}
+	// sql.Open does not dial, so this pools a handle without a database.
+	if _, _, err := s.sql.Open("prod", spec); err != nil {
+		t.Fatal(err)
+	}
+	if !s.sql.Pooled("prod") {
+		t.Fatal("the connection was not pooled, so the test proves nothing")
+	}
+
+	// Re-applying with a new url must drop it.
+	doc2 := strings.Replace(doc1, "old.example.invalid", "new.example.invalid", 1)
+	if rec, _ := apply(t, s, doc("/work/sql.yaml", doc2)); rec.Code != http.StatusOK {
+		t.Fatalf("re-apply: status %d: %s", rec.Code, rec.Body)
+	}
+	if s.sql.Pooled("prod") {
+		t.Error("re-applying a changed url left the old connection pooled")
+	}
+
+	// So must deleting it.
+	if _, _, err := s.sql.Open("prod", spec); err != nil {
+		t.Fatal(err)
+	}
+	req := httptest.NewRequest(http.MethodDelete, api.Prefix+"/sqlconnections/prod", nil)
+	rec := httptest.NewRecorder()
+	s.Handler().ServeHTTP(rec, req)
+	if rec.Code != http.StatusNoContent {
+		t.Fatalf("delete: status %d: %s", rec.Code, rec.Body)
+	}
+	if s.sql.Pooled("prod") {
+		t.Error("deleting the object left its connection open")
+	}
+}

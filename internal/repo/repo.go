@@ -94,6 +94,22 @@ func (r *Reconciler) Reconcile(ctx context.Context, name string, spec *object.Re
 	if err := r.fetch(ctx, path, spec.Branch); err != nil {
 		return nil, err
 	}
+
+	// A fetch that brought nothing new, onto a worktree nobody has touched,
+	// needs no checkout and no reset.
+	//
+	// Worth the two extra read-only commands: `checkout -B` followed by
+	// `reset --hard` rewrites the index and walks the worktree, and on a
+	// large repository that is disk churn every refresh interval, forever,
+	// to arrive at the tree that was already there. Most ticks find nothing.
+	//
+	// Both halves are load-bearing. Equal commits alone are not enough --
+	// this tree is a mirror, so a local edit has to be discarded even when
+	// the remote has not moved.
+	if commit, ok := r.upToDate(ctx, path); ok {
+		return &Result{Branch: spec.Branch, Commit: commit}, nil
+	}
+
 	if err := r.reset(ctx, path, spec.Branch); err != nil {
 		return nil, err
 	}
@@ -163,6 +179,36 @@ func (r *Reconciler) reset(ctx context.Context, path, branch string) error {
 func (r *Reconciler) head(ctx context.Context, path string) (string, error) {
 	out, err := r.git(ctx, path, "rev-parse", "HEAD")
 	return strings.TrimSpace(out), err
+}
+
+// upToDate reports whether the checkout already is what a reset would make
+// it: sitting on the fetched commit, with nothing modified on top.
+//
+// Any doubt answers false. A wrongly skipped reset leaves a stale tree that
+// an agent then reads as current, which is far worse than a reset that did
+// not need doing.
+func (r *Reconciler) upToDate(ctx context.Context, path string) (string, bool) {
+	out, err := r.git(ctx, path, "rev-parse", "HEAD", "FETCH_HEAD")
+	if err != nil {
+		return "", false
+	}
+	revs := strings.Fields(out)
+	if len(revs) != 2 || revs[0] != revs[1] {
+		return "", false
+	}
+	// status rather than `diff-index --quiet`: diff-index reads the index's
+	// stat cache and does not refresh it, so a file whose mtime moved but
+	// whose content did not reads as modified, and every tick would then do
+	// the reset this exists to avoid. status refreshes first.
+	//
+	// Untracked files are excluded because `reset --hard` does not remove
+	// them either, so counting them as work to do would mean a checkout with
+	// one stray file resets forever.
+	out, err = r.git(ctx, path, "status", "--porcelain", "--untracked-files=no")
+	if err != nil || strings.TrimSpace(out) != "" {
+		return "", false
+	}
+	return revs[0], true
 }
 
 // --- marker ---

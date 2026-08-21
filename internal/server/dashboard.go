@@ -205,14 +205,14 @@ func (s *Server) Reload(cfgPath string) (string, *config.Config, error) {
 		if err := s.store.Put(o); err != nil {
 			return "", nil, err
 		}
-		if s.sync != nil {
-			// Picks up a changed url, branch or refreshInterval immediately.
-			_ = s.sync.Ensure(o)
-		}
+		// Picks up a changed url, branch or refreshInterval immediately, and
+		// drops the pooled connection of a changed database. Same hook the
+		// apply and put routes use, so reloading a file and applying it by
+		// hand cannot drift apart.
+		s.objectChanged(o)
 	}
 
-	// A connection that was failing may be reachable now, and one whose url
-	// changed needs its pooled connection dropped.
+	// A connection that was failing may be reachable now.
 	go s.recheckSQL(batch.Objects)
 
 	return fmt.Sprintf("reloaded %d object(s) from %d file(s): %d created, %d updated",
@@ -225,7 +225,6 @@ func (s *Server) recheckSQL(objs []*object.Object) {
 			continue
 		}
 		name := o.Metadata.Name
-		s.sql.Forget(name)
 		spec, err := o.SQLConnection()
 		if err != nil {
 			continue

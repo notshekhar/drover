@@ -17,8 +17,10 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"runtime"
 	"sort"
 	"strings"
+	"sync"
 )
 
 // Limits keep a tool result inside a context window and keep one careless
@@ -30,7 +32,55 @@ const (
 	MaxFindResults = 500
 	MaxListEntries = 1000
 	binarySniff    = 8 << 10
+
+	// keepBufferBytes caps the read buffer a grep worker holds on to between
+	// files. Without it, one 16MB blob in a repository would leave every
+	// worker sitting on 16MB for the life of the process.
+	keepBufferBytes = 1 << 20
 )
+
+// maxGrepFileBytes is how large a file grep will read in one piece. Anything
+// bigger falls back to a streaming scan, so nothing is silently skipped -- it
+// just does not get the fast path. A var so a test can reach the slow path
+// without writing sixteen megabytes to do it.
+var maxGrepFileBytes int64 = 16 << 20
+
+// skipDirs are directories a search walks past.
+//
+// This is the difference between grep being useful on a JavaScript
+// repository and being useless on one. A checkout of a real project is
+// overwhelmingly dependencies and build output -- on one measured repository,
+// 143,690 of 147,852 files were node_modules -- and searching them is worse
+// than slow: the result cap fills up with vendored copies and minified
+// bundles before the walk ever reaches the source someone asked about.
+//
+// The base of a search is never skipped, so naming one of these explicitly
+// (grep with path=repo/node_modules/foo) still searches it. The list is for
+// what a search walks *into*, not what it is pointed at.
+var skipDirs = map[string]bool{
+	".git":          true,
+	"node_modules":  true,
+	"vendor":        true,
+	"dist":          true,
+	"build":         true,
+	"target":        true,
+	"out":           true,
+	".next":         true,
+	".nuxt":         true,
+	".svelte-kit":   true,
+	".venv":         true,
+	"venv":          true,
+	"__pycache__":   true,
+	".mypy_cache":   true,
+	".pytest_cache": true,
+	".gradle":       true,
+	".tox":          true,
+	".terraform":    true,
+	"Pods":          true,
+	".cargo":        true,
+	".turbo":        true,
+	".cache":        true,
+}
 
 // Root is the directory holding every checkout.
 type Root struct {
@@ -330,11 +380,18 @@ func (r *Root) Read(rel string, offset, limit int) (*ReadResult, error) {
 
 	// Keep counting past the window, so the caller is told how much file it
 	// did not get rather than being left to guess from the line numbers.
-	total := line
-	for sc.Scan() {
-		total++
+	//
+	// Counting newlines in bulk rather than running the Scanner to EOF: the
+	// tail is not being read, only measured, and splitting twenty megabytes
+	// into lines to learn how many there are is work with no output.
+	// Counted from the start rather than from where the Scanner left off:
+	// the Scanner reads ahead, so its file offset is somewhere past the last
+	// line it handed back, and there is no cheap way to ask it where.
+	if _, err := f.Seek(0, io.SeekStart); err != nil {
+		return nil, err
 	}
-	if err := sc.Err(); err != nil {
+	total, err := countLines(f)
+	if err != nil {
 		return nil, fmt.Errorf("read %s: %w", r.display(abs), err)
 	}
 	if total > end {
@@ -349,6 +406,35 @@ func (r *Root) Read(rel string, offset, limit int) (*ReadResult, error) {
 		TotalLines: total,
 		Truncated:  truncated,
 	}, nil
+}
+
+// countLines counts the lines in f from its current offset, in bulk.
+//
+// The last line counts even without a trailing newline, which is what the
+// Scanner this replaced did.
+func countLines(f *os.File) (int, error) {
+	buf := make([]byte, 64<<10)
+	n := 0
+	empty := true
+	endsWithNewline := true
+	for {
+		read, err := f.Read(buf)
+		if read > 0 {
+			empty = false
+			n += bytes.Count(buf[:read], []byte{'\n'})
+			endsWithNewline = buf[read-1] == '\n'
+		}
+		if errors.Is(err, io.EOF) {
+			break
+		}
+		if err != nil {
+			return 0, err
+		}
+	}
+	if !empty && !endsWithNewline {
+		n++
+	}
+	return n, nil
 }
 
 func clipLine(s string) string {
@@ -393,6 +479,12 @@ type GrepOptions struct {
 }
 
 // Grep searches file contents for a regular expression.
+//
+// Every matching file is searched and the results are sorted before the cap
+// is applied, rather than stopping at the first N hits in walk order. That
+// costs a full walk, but it is what makes the answer stable: the same query
+// against the same checkout returns the same 200 lines, instead of whichever
+// 200 the directory order happened to reach first.
 func (r *Root) Grep(pattern string, opts GrepOptions) (*GrepResult, error) {
 	if strings.TrimSpace(pattern) == "" {
 		return nil, errors.New("the pattern is empty")
@@ -402,6 +494,10 @@ func (r *Root) Grep(pattern string, opts GrepOptions) (*GrepResult, error) {
 		expr = "(?i)" + expr
 	}
 	re, err := regexp.Compile(expr)
+	if err != nil {
+		return nil, fmt.Errorf("pattern is not a valid regular expression: %w", err)
+	}
+	probe, err := wholeFileProbe(expr, pattern)
 	if err != nil {
 		return nil, fmt.Errorf("pattern is not a valid regular expression: %w", err)
 	}
@@ -415,41 +511,199 @@ func (r *Root) Grep(pattern string, opts GrepOptions) (*GrepResult, error) {
 		max = MaxGrepResults
 	}
 
-	out := &GrepResult{Matches: []Match{}}
+	// Collect the candidate paths first. The walk is one directory-order pass
+	// and cheap; reading and matching the files is the expensive half, and
+	// that is what gets spread across cores.
+	var paths []string
+	var globErr error
 	err = r.walk(base, func(abs string, d os.DirEntry) error {
 		if opts.Include != "" {
 			ok, err := filepath.Match(opts.Include, d.Name())
 			if err != nil {
-				return fmt.Errorf("include %q is not a valid glob: %w", opts.Include, err)
+				globErr = fmt.Errorf("include %q is not a valid glob: %w", opts.Include, err)
+				return errStop
 			}
 			if !ok {
 				return nil
 			}
 		}
-		out.Files++
-		return r.grepFile(abs, re, out, max)
+		paths = append(paths, abs)
+		return nil
 	})
+	if globErr != nil {
+		return nil, globErr
+	}
 	if err != nil && !errors.Is(err, errStop) {
 		return nil, err
 	}
-	if errors.Is(err, errStop) {
+
+	matches := r.grepAll(paths, re, probe)
+	sort.Slice(matches, func(i, j int) bool {
+		if matches[i].Path != matches[j].Path {
+			return matches[i].Path < matches[j].Path
+		}
+		return matches[i].Line < matches[j].Line
+	})
+
+	out := &GrepResult{Matches: matches, Files: len(paths)}
+	if out.Matches == nil {
+		out.Matches = []Match{}
+	}
+	if len(out.Matches) > max {
+		out.Matches = out.Matches[:max]
 		out.Truncated = true
 	}
 	return out, nil
 }
 
-func (r *Root) grepFile(abs string, re *regexp.Regexp, out *GrepResult, max int) error {
+// wholeFileProbe builds the regexp used to reject a file in one pass, before
+// it is split into lines.
+//
+// The probe is the same pattern in multi-line mode, so that "a line matches"
+// and "the file matches" mean the same thing and the probe can never hide a
+// hit. Two exceptions get no probe at all, because for them the two are not
+// the same thing:
+//
+//   - a pattern containing "$". Line scanning sees a line with its trailing
+//     "\r" already stripped, so `foo$` matches on a CRLF file; the probe,
+//     looking at the raw bytes, would see the "\r" and miss it.
+//   - a pattern containing "\r", for the same reason in reverse.
+//
+// A probe that matches when no line does is harmless -- the line scan simply
+// finds nothing. A probe that fails when a line would have matched is a
+// wrong answer, so those two cases skip it.
+func wholeFileProbe(expr, raw string) (*regexp.Regexp, error) {
+	if strings.Contains(raw, "$") || strings.Contains(raw, `\r`) {
+		return nil, nil
+	}
+	return regexp.Compile("(?m)" + expr)
+}
+
+// grepAll searches every path, one worker per core.
+func (r *Root) grepAll(paths []string, re, probe *regexp.Regexp) []Match {
+	workers := runtime.NumCPU()
+	if workers > len(paths) {
+		workers = len(paths)
+	}
+	if workers < 1 {
+		return nil
+	}
+
+	// Each worker keeps its own slice and they are joined at the end, so the
+	// hot loop never touches a shared lock.
+	found := make([][]Match, workers)
+	next := make(chan string, workers*4)
+	var wg sync.WaitGroup
+	for i := 0; i < workers; i++ {
+		wg.Add(1)
+		go func(slot int) {
+			defer wg.Done()
+			var buf []byte
+			for abs := range next {
+				found[slot] = r.grepFile(abs, re, probe, &buf, found[slot])
+			}
+		}(i)
+	}
+	for _, p := range paths {
+		next <- p
+	}
+	close(next)
+	wg.Wait()
+
+	total := 0
+	for _, f := range found {
+		total += len(f)
+	}
+	out := make([]Match, 0, total)
+	for _, f := range found {
+		out = append(out, f...)
+	}
+	return out
+}
+
+// grepFile appends this file's matches to out.
+//
+// The file is read in one piece into a buffer the worker reuses, and lines
+// are matched as byte slices. The obvious version -- bufio.Scanner plus
+// sc.Text() -- allocates a string for every line in the checkout, which on a
+// large repository is tens of millions of allocations and gigabytes of
+// garbage for a search that returns nothing.
+func (r *Root) grepFile(abs string, re, probe *regexp.Regexp, buf *[]byte, out []Match) []Match {
 	f, err := os.Open(abs)
 	if err != nil {
-		return nil // unreadable file is not a search failure
+		return out // unreadable file is not a search failure
 	}
 	defer f.Close()
 
-	if binary, err := looksBinary(f); err != nil || binary {
-		return nil
+	info, err := f.Stat()
+	if err != nil {
+		return out
+	}
+	if info.Size() > maxGrepFileBytes {
+		return r.grepStream(abs, f, re, out)
+	}
+
+	if cap(*buf) < int(info.Size()) {
+		*buf = make([]byte, info.Size())
+	}
+	data := (*buf)[:info.Size()]
+	n, err := io.ReadFull(f, data)
+	if err != nil && !errors.Is(err, io.ErrUnexpectedEOF) && !errors.Is(err, io.EOF) {
+		return out
+	}
+	data = data[:n]
+	if cap(*buf) > keepBufferBytes {
+		*buf = nil
+	}
+
+	if isBinary(data) {
+		return out
+	}
+	// One pass to reject the whole file. Most files in a checkout contain the
+	// pattern nowhere, and this is far cheaper than running the matcher once
+	// per line to learn that.
+	if probe != nil && !probe.Match(data) {
+		return out
+	}
+
+	line := 0
+	for len(data) > 0 {
+		line++
+		row := data
+		if i := bytes.IndexByte(data, '\n'); i >= 0 {
+			row, data = data[:i], data[i+1:]
+		} else {
+			data = nil
+		}
+		// bufio.Scanner drops a trailing "\r" before the caller ever sees the
+		// line, so matching has to as well or a CRLF checkout answers
+		// differently from an LF one.
+		row = bytes.TrimSuffix(row, []byte("\r"))
+		if !re.Match(row) {
+			continue
+		}
+		out = append(out, Match{Path: r.display(abs), Line: line, Text: clipLine(string(row))})
+	}
+	return out
+}
+
+// grepStream is the fallback for a file too large to hold in memory. It is
+// the streaming scan, kept for exactly that case rather than deleted, so a
+// giant file is searched slowly instead of not at all.
+func (r *Root) grepStream(abs string, f *os.File, re *regexp.Regexp, out []Match) []Match {
+	if _, err := f.Seek(0, io.SeekStart); err != nil {
+		return out
+	}
+	head := make([]byte, binarySniff)
+	n, err := f.Read(head)
+	if err != nil && !errors.Is(err, io.EOF) {
+		return out
+	}
+	if isBinary(head[:n]) {
+		return out
 	}
 	if _, err := f.Seek(0, io.SeekStart); err != nil {
-		return nil
+		return out
 	}
 
 	sc := bufio.NewScanner(f)
@@ -457,20 +711,20 @@ func (r *Root) grepFile(abs string, re *regexp.Regexp, out *GrepResult, max int)
 	line := 0
 	for sc.Scan() {
 		line++
-		text := sc.Text()
-		if !re.MatchString(text) {
+		if !re.Match(sc.Bytes()) {
 			continue
 		}
-		if len(out.Matches) >= max {
-			return errStop
-		}
-		out.Matches = append(out.Matches, Match{
-			Path: r.display(abs),
-			Line: line,
-			Text: clipLine(strings.TrimRight(text, "\r")),
-		})
+		out = append(out, Match{Path: r.display(abs), Line: line, Text: clipLine(sc.Text())})
 	}
-	return nil
+	return out
+}
+
+// isBinary sniffs for a NUL byte, which no text file has.
+func isBinary(data []byte) bool {
+	if len(data) > binarySniff {
+		data = data[:binarySniff]
+	}
+	return bytes.IndexByte(data, 0) >= 0
 }
 
 // --- find ---
@@ -532,8 +786,12 @@ func (r *Root) Find(pattern, path string, maxResults int) (*FindResult, error) {
 
 var errStop = errors.New("enough")
 
-// walk visits every regular file under base, skipping .git and never
-// following a symlink out of the root.
+// walk visits every regular file under base, skipping dependency and build
+// directories and never following a symlink out of the root.
+//
+// base is exempt from the skip list. Someone who points a search at
+// node_modules meant it; the list is only about what a walk wanders into on
+// its way somewhere else.
 func (r *Root) walk(base string, fn func(abs string, d os.DirEntry) error) error {
 	return filepath.WalkDir(base, func(abs string, d os.DirEntry, err error) error {
 		if err != nil {
@@ -544,7 +802,7 @@ func (r *Root) walk(base string, fn func(abs string, d os.DirEntry) error) error
 			return nil
 		}
 		if d.IsDir() {
-			if d.Name() == ".git" {
+			if abs != base && skipDirs[d.Name()] {
 				return filepath.SkipDir
 			}
 			return nil

@@ -86,6 +86,14 @@ type Server struct {
 	// closing the listener out from under them.
 	mu      sync.Mutex
 	httpSrv *http.Server
+
+	// The watcher's cached parse of the config file, keyed on its size and
+	// mtime. The watcher ticks once a second forever, so this is the
+	// difference between an idle engine parsing yaml 86,400 times a day and
+	// parsing it when it changes.
+	cfgMu    sync.Mutex
+	cfgStamp string
+	cfgCache *config.Config
 }
 
 // New builds a server over the data directory.
@@ -531,6 +539,21 @@ func (s *Server) handleApply(w http.ResponseWriter, r *http.Request) {
 			Name:   o.Metadata.Name,
 			Action: actions[i],
 		})
+		s.objectChanged(o)
+	}
+	writeJSON(w, http.StatusOK, resp)
+}
+
+// objectChanged is what has to happen after an object is written, beyond
+// storing it.
+//
+// Both apply and put land here. Without it a re-applied SQLConnection keeps
+// answering from the connection opened against its previous dsn, which looks
+// exactly like the new credentials working -- until someone notices the rows
+// came from the old database.
+func (s *Server) objectChanged(o *object.Object) {
+	switch o.Kind {
+	case object.KindRepository:
 		// Reconcile now and pick up any change to refreshInterval, rather
 		// than waiting out the old cadence.
 		if s.sync != nil {
@@ -538,8 +561,9 @@ func (s *Server) handleApply(w http.ResponseWriter, r *http.Request) {
 				s.logf("repository %s: %v", o.Metadata.Name, err)
 			}
 		}
+	case object.KindSQLConnection:
+		s.sql.Forget(o.Metadata.Name)
 	}
-	writeJSON(w, http.StatusOK, resp)
 }
 
 func (s *Server) handlePut(w http.ResponseWriter, r *http.Request, kind object.Kind) {
@@ -577,6 +601,7 @@ func (s *Server) handlePut(w http.ResponseWriter, r *http.Request, kind object.K
 		writeErr(w, http.StatusInternalServerError, err)
 		return
 	}
+	s.objectChanged(o)
 	writeJSON(w, http.StatusOK, s.viewWithStatus(o))
 }
 
@@ -624,10 +649,20 @@ func (s *Server) handleDelete(w http.ResponseWriter, r *http.Request, kind objec
 		if s.sync != nil {
 			s.sync.Stop(name)
 		}
+		// Before the directory goes: a language server started against this
+		// checkout would otherwise keep running against a path that no
+		// longer exists, answering from a tree only it can still see, until
+		// the idle reaper gets to it half an hour later.
+		s.lsp.Restart(name)
 		if err := s.repo.Remove(name); err != nil {
 			writeErr(w, http.StatusInternalServerError, fmt.Errorf("object deleted but its checkout remains at %s: %w", s.repo.Path(name), err))
 			return
 		}
+	}
+	if kind == object.KindSQLConnection {
+		// Closes the pool rather than leaving its connections open against a
+		// database drover no longer knows about.
+		s.sql.Forget(name)
 	}
 	_ = s.store.DeleteStatus(kind, name)
 	w.WriteHeader(http.StatusNoContent)

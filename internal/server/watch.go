@@ -98,7 +98,12 @@ func (s *Server) fingerprint(cfgPath string) string {
 		paths = append(paths, dropIns...)
 	}
 	// The config may point at files outside the data directory.
-	if cfg, err := config.Load(cfgPath); err == nil && len(cfg.Apply) > 0 {
+	//
+	// Parsing it is cached on its own mtime and size. This runs once a
+	// second for the life of the engine, and re-reading and re-parsing a
+	// file that has not moved -- then re-expanding every apply: path it
+	// names -- is a steady cost on an engine that is otherwise idle.
+	for _, cfg := range s.cachedConfig(cfgPath) {
 		if files, err := config.CollectAll(cfg.Apply); err == nil {
 			paths = append(paths, files...)
 		}
@@ -116,4 +121,28 @@ func (s *Server) fingerprint(cfgPath string) string {
 		fmt.Fprintf(&b, "%s:%d:%d\n", p, info.Size(), info.ModTime().UnixNano())
 	}
 	return b.String()
+}
+
+// cachedConfig parses cfgPath, reusing the last parse while the file has not
+// changed. It returns nothing when there is no config or it has no apply:
+// paths, so the caller can range over the result either way.
+func (s *Server) cachedConfig(cfgPath string) []*config.Config {
+	stamp := ""
+	if info, err := os.Stat(cfgPath); err == nil {
+		stamp = fmt.Sprintf("%d:%d", info.Size(), info.ModTime().UnixNano())
+	}
+
+	s.cfgMu.Lock()
+	defer s.cfgMu.Unlock()
+	if stamp == "" || stamp != s.cfgStamp {
+		s.cfgStamp = stamp
+		s.cfgCache = nil
+		if cfg, err := config.Load(cfgPath); err == nil && len(cfg.Apply) > 0 {
+			s.cfgCache = cfg
+		}
+	}
+	if s.cfgCache == nil {
+		return nil
+	}
+	return []*config.Config{s.cfgCache}
 }

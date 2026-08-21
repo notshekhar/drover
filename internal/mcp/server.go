@@ -329,14 +329,14 @@ var fileTools = []Tool{
 	},
 	{
 		Name:        "grep",
-		Description: "Search file contents across the repositories with a regular expression. Use this to find where something is defined or used, then read that file.",
+		Description: "Search file contents across the repositories with a regular expression. Use this to find where something is defined or used, then read that file. Dependency and build directories (node_modules, vendor, dist, target, .venv and the like) are skipped, so results are the project's own code; to search one anyway, name it in `path`.",
 		InputSchema: Schema{
 			Type:       "object",
 			Additional: boolPtr(false),
 			Required:   []string{"pattern"},
 			Properties: map[string]Prop{
 				"pattern":       {Type: "string", Description: "Go/RE2 regular expression, e.g. `func NewServer` or `TODO|FIXME`."},
-				"path":          {Type: "string", Description: "Limit the search to this subtree, e.g. `api/internal`."},
+				"path":          {Type: "string", Description: "Limit the search to this subtree, e.g. `api/internal`. Naming a skipped directory here searches it, e.g. `web/node_modules`."},
 				"include":       {Type: "string", Description: "Only search files whose name matches this glob, e.g. `*.go`."},
 				"caseSensitive": {Type: "boolean", Description: "Match case exactly. Defaults to false.", Default: false},
 				"maxResults":    {Type: "integer", Description: "Cap the number of matches returned."},
@@ -345,14 +345,14 @@ var fileTools = []Tool{
 	},
 	{
 		Name:        "find",
-		Description: "Find files by name or path pattern. A pattern without a slash matches the file name (`*.go`); one with a slash matches the whole path (`api/internal/*.go`).",
+		Description: "Find files by name or path pattern. A pattern without a slash matches the file name (`*.go`); one with a slash matches the whole path (`api/internal/*.go`). Dependency and build directories are skipped unless `path` names one.",
 		InputSchema: Schema{
 			Type:       "object",
 			Additional: boolPtr(false),
 			Required:   []string{"pattern"},
 			Properties: map[string]Prop{
 				"pattern":    {Type: "string", Description: "Glob, e.g. `*_test.go` or `api/cmd/*`."},
-				"path":       {Type: "string", Description: "Limit the search to this subtree."},
+				"path":       {Type: "string", Description: "Limit the search to this subtree. Naming a skipped directory here searches it."},
 				"maxResults": {Type: "integer", Description: "Cap the number of paths returned."},
 			},
 		},
