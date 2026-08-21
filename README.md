@@ -283,6 +283,29 @@ For a client that only speaks stdio:
 claude mcp add drover -- drover mcp
 ```
 
+An agent is told what this engine holds, and what it is for, before it calls
+anything. The connection handshake carries three things: when to reach for
+drover at all — grounding a plan in how the thing is actually done today,
+following a bug across a service boundary, settling a claim about code nobody
+has open — then which tool answers which question, then the actual contents.
+The repositories by name with their branch and how long ago each synced, the
+environments, how many requests are callable, which databases are queryable.
+There is no first call spent finding out, and no guessing at a repository name.
+
+That list is a snapshot from when the agent connected, so two resources keep it
+honest:
+
+| resource | what |
+|---|---|
+| `drover://reference` | how to configure drover — every kind, its fields, the placeholder rules |
+| `drover://inventory` | what the engine holds *now*, re-readable at any time |
+
+Over stdio, drover also announces when its tool list changes. Apply a database
+and `sql_query` appears; drop a yaml file in `~/.drover` and the request tools
+arrive — a connected agent is told, without reconnecting. The HTTP transport
+has no channel for a server-initiated message, so it does not advertise that it
+will send one.
+
 Tools an agent gets:
 
 | tool | does |

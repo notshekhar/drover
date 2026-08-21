@@ -62,6 +62,22 @@ type Server struct {
 	langMu    sync.Mutex
 	langCache string
 	langAt    time.Time
+
+	// invCache holds the rendered inventory, on the same reasoning: building
+	// it lists four kinds from the engine, and both initialize and the
+	// inventory resource ask for it.
+	invMu    sync.Mutex
+	invCache string
+	invAt    time.Time
+
+	// notify sends a server-initiated message, and is set only by the stdio
+	// transport -- the HTTP endpoint answers GET with 405 and so has no way to
+	// reach the client between requests. Its presence is what initialize
+	// consults before promising tools/listChanged.
+	notify    func(method string, params any)
+	watchDone chan struct{}
+	watchMu   sync.Mutex
+	watching  bool
 }
 
 // Tool is one advertised tool.
@@ -118,16 +134,23 @@ func (s *Server) router() *router {
 	r := newRouter()
 
 	r.handle("initialize", s.initialize)
-	r.handle("notifications/initialized", func(json.RawMessage) (any, *rpcError) { return nil, nil })
+	r.handle("notifications/initialized", func(json.RawMessage) (any, *rpcError) {
+		// The handshake is over, so a server-initiated message is now legal.
+		// Starting the watcher any earlier would put one in the middle of it.
+		s.startToolWatch()
+		return nil, nil
+	})
 	r.handle("ping", func(json.RawMessage) (any, *rpcError) { return map[string]any{}, nil })
 	r.handle("tools/list", s.listTools)
 	r.handle("tools/call", s.callTool)
 
-	// Declared but empty, so a client that asks does not get a method-not-found
-	// it has to special-case.
-	r.handle("resources/list", func(json.RawMessage) (any, *rpcError) {
-		return map[string]any{"resources": []any{}}, nil
-	})
+	r.handle("resources/list", s.listResources)
+	r.handle("resources/read", s.readResource)
+
+	// Declared but empty, so a client that asks does not get a
+	// method-not-found it has to special-case. Prompts are user-invoked, which
+	// makes them a good home for a canned investigation later; there is
+	// nothing to put there yet.
 	r.handle("prompts/list", func(json.RawMessage) (any, *rpcError) {
 		return map[string]any{"prompts": []any{}}, nil
 	})
@@ -136,8 +159,48 @@ func (s *Server) router() *router {
 
 // Serve runs the MCP server over the given streams until input closes. This is
 // the stdio transport, which is what an agent spawning a process speaks.
+//
+// It is also the only transport that can deliver a server-initiated message,
+// so it is the only one that advertises tools/listChanged. The notifier is
+// installed before the router is built, because initialize reads it to decide
+// what to promise.
 func (s *Server) Serve(in io.Reader, out io.Writer) error {
-	return newConn(in, out, s.router()).serve()
+	c := newConn(in, out, nil)
+
+	done := make(chan struct{})
+	defer close(done)
+
+	s.notify = c.notify
+	s.watchDone = done
+	c.router = s.router()
+
+	return c.serve()
+}
+
+// startToolWatch launches the tool-list watcher, at most once per connection.
+func (s *Server) startToolWatch() {
+	if s.notify == nil {
+		return
+	}
+	s.watchMu.Lock()
+	defer s.watchMu.Unlock()
+	if s.watching {
+		// A client may send initialized more than once; a second watcher would
+		// double every notification.
+		return
+	}
+	s.watching = true
+
+	// Synchronously, before the goroutine exists. A baseline read inside the
+	// goroutine would be read at whatever moment the scheduler chose, and
+	// anything applied in between would be folded into it -- invisible from
+	// then on, since it would never differ from the baseline again.
+	//
+	// An unreachable engine leaves this empty on purpose: the first successful
+	// read then becomes the baseline, rather than the jump from nothing to
+	// everything counting as a change.
+	baseline, _ := s.toolFingerprint()
+	go s.watchToolChanges(s.notify, baseline, s.watchDone)
 }
 
 func (s *Server) initialize(params json.RawMessage) (any, *rpcError) {
@@ -151,22 +214,61 @@ func (s *Server) initialize(params json.RawMessage) (any, *rpcError) {
 		version = req.ProtocolVersion
 	}
 
+	// listChanged is a promise to send notifications/tools/list_changed, and
+	// only the stdio transport can keep it: the HTTP endpoint has no
+	// server-initiated stream, so a client there has nowhere to receive one.
+	// Advertising it on both would leave an HTTP client waiting for a message
+	// that can never arrive, and re-listing only when it happens to reconnect.
+	tools := map[string]any{}
+	if s.notify != nil {
+		tools["listChanged"] = true
+	}
+
 	return map[string]any{
 		"protocolVersion": version,
 		"capabilities": map[string]any{
-			// listChanged: the tool list really does change when someone
-			// applies a new object, and a client that re-lists will see it.
-			"tools": map[string]any{"listChanged": true},
+			"tools": tools,
+			// resources: the list is fixed at two, so no listChanged here.
+			"resources": map[string]any{},
 		},
 		"serverInfo": map[string]any{
 			"name":    "drover",
 			"version": s.Version,
 		},
-		"instructions": instructions,
+		"instructions": s.instructions(),
 	}, nil
 }
 
+// instructions is the static how-to-use-drover text with an inventory of what
+// this particular engine holds appended.
+//
+// The two halves are different in kind. The first never changes and explains
+// which tool answers which question; the second is knowable only by a running
+// engine, and is the half that saves an agent its first round trip.
+func (s *Server) instructions() string {
+	inv := s.inventory()
+	if inv == "" {
+		return instructions
+	}
+	return instructions + "\n\n" + inv +
+		"\nThis list was taken when you connected. Read the drover://inventory resource for what the engine holds now."
+}
+
 const instructions = `drover holds git checkouts, HTTP requests and database connections that have been applied to it.
+
+These are usually NOT the code you are editing. They are the rest of the system around it: services you call, services that call you, shared libraries, vendored references. Reach for drover whenever a question runs past the edge of your own workspace -- and check here before answering from memory about another service, because these are the real files at a real commit, not a recollection of them.
+
+What that is worth doing:
+
+Writing a plan, a PRD or a design doc: read how the thing is done today before proposing how it should be done. grep every repository at once for the pattern you are about to introduce, read the service you would call, api_describe the endpoint you would depend on, sql_query the table you would write to. A plan that names real files, real fields and real endpoints can be acted on; one written from assumption has to be corrected first.
+
+Debugging something that crosses a boundary: the bug is often not in the code you can see. Read the caller to find out what it actually sends, api_call the endpoint to see what it actually returns, sql_query the row to see what is actually stored, and git log or git blame the line to find out when the behaviour changed and what shipped alongside it. Each of those is a fact, so a chain of them ends in a cause rather than a theory.
+
+Understanding an unfamiliar service: ls it, read its entry point, lsp workspace_symbols for the type the whole thing is built around, git contributors to learn who to ask.
+
+Checking a claim: "we already have a helper for this", "that endpoint returns a list", "nobody calls this any more" -- grep, api_call and lsp references settle each of those in one call.
+
+You write your own files with your own tools. Nothing here writes anything: every drover tool reads.
 
 Use ls, read, grep and find to explore the repositories it holds. Paths are relative to the repository root, so they start with the repository name: ` + "`api/src/main.go`" + `. Call ls with no path to see which repositories are available.
 

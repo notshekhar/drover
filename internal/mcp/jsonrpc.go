@@ -161,6 +161,26 @@ func (c *conn) readLine() ([]byte, error) {
 	}
 }
 
+// notify sends a server-initiated message. It carries no id, so the peer must
+// not answer it -- which is also why it goes out through the same mutex as
+// every reply: two goroutines interleaving bytes on one line would corrupt
+// both messages.
+func (c *conn) notify(method string, params any) {
+	msg := struct {
+		JSONRPC string `json:"jsonrpc"`
+		Method  string `json:"method"`
+		Params  any    `json:"params,omitempty"`
+	}{JSONRPC: "2.0", Method: method, Params: params}
+
+	data, err := json.Marshal(msg)
+	if err != nil {
+		return
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	_, _ = c.out.Write(append(data, '\n'))
+}
+
 func (c *conn) write(resp *response) {
 	data, err := json.Marshal(resp)
 	if err != nil {

@@ -52,6 +52,25 @@ func start(t *testing.T, dataDir string) *session {
 	return sess
 }
 
+// startDetached runs the bridge against an engine that is not there, which is
+// what `drover mcp` gets when an agent spawns it before `drover serve`.
+func startDetached(t *testing.T) *session {
+	t.Helper()
+
+	clientIn, serverIn := io.Pipe()
+	serverOut, clientOut := io.Pipe()
+
+	// A port nothing is listening on, so every call fails the way a stopped
+	// engine fails rather than hanging.
+	s := &mcp.Server{Backend: client.New("http://127.0.0.1:1"), Version: "test"}
+	done := make(chan error, 1)
+	go func() { done <- s.Serve(clientIn, clientOut) }()
+
+	sess := &session{t: t, in: serverIn, out: bufio.NewReaderSize(serverOut, 1<<20), done: done}
+	t.Cleanup(func() { serverIn.Close() })
+	return sess
+}
+
 // call sends a request and returns the parsed response.
 func (s *session) call(method string, params any) map[string]any {
 	s.t.Helper()
