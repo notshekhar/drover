@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"flag"
 	"fmt"
@@ -34,7 +35,7 @@ func clientFor(dataDirFlag, configFlag, serverFlag *string) (*client.Client, err
 	return client.New(url), nil
 }
 
-func cmdGet(args []string) error {
+func cmdGet(ctx context.Context, args []string) error {
 	fs := flag.NewFlagSet("get", flag.ContinueOnError)
 	fs.SetOutput(os.Stderr)
 	var (
@@ -61,14 +62,14 @@ func cmdGet(args []string) error {
 	}
 
 	if len(rest) > 1 {
-		v, err := c.Get(kind, rest[1])
+		v, err := c.Get(ctx, kind, rest[1])
 		if err != nil {
 			return err
 		}
 		return printViews([]api.ObjectView{*v}, *outFlag, kind)
 	}
 
-	items, err := c.List(kind)
+	items, err := c.List(ctx, kind)
 	if err != nil {
 		return err
 	}
@@ -218,7 +219,7 @@ func dash(s string) string {
 	return s
 }
 
-func cmdDelete(args []string) error {
+func cmdDelete(ctx context.Context, args []string) error {
 	fs := flag.NewFlagSet("delete", flag.ContinueOnError)
 	fs.SetOutput(os.Stderr)
 	var (
@@ -242,19 +243,19 @@ func cmdDelete(args []string) error {
 	if err != nil {
 		return err
 	}
-	if err := c.Delete(kind, rest[1]); err != nil {
+	if err := c.Delete(ctx, kind, rest[1]); err != nil {
 		return err
 	}
 	fmt.Printf("%s/%s deleted\n", kind, rest[1])
 
 	// An apply: path that no longer accounts for any object is dead weight,
 	// and on the next serve it would be re-applied and bring the object back.
-	return pruneApplyList(*dataDirFlag, *configFlag, c)
+	return pruneApplyList(ctx, *dataDirFlag, *configFlag, c)
 }
 
 // pruneApplyList drops config apply: entries that no stored object still
 // points at.
-func pruneApplyList(dataDirFlag, configFlag string, c *client.Client) error {
+func pruneApplyList(ctx context.Context, dataDirFlag, configFlag string, c *client.Client) error {
 	dataDir, err := config.DataDir(dataDirFlag)
 	if err != nil {
 		return nil // best effort: the delete already succeeded
@@ -270,7 +271,7 @@ func pruneApplyList(dataDirFlag, configFlag string, c *client.Client) error {
 
 	inUse := map[string]bool{}
 	for _, kind := range object.Kinds {
-		items, err := c.List(kind)
+		items, err := c.List(ctx, kind)
 		if err != nil {
 			return nil
 		}
@@ -316,7 +317,7 @@ func stillFeeds(path string, inUse map[string]bool) bool {
 	return false
 }
 
-func cmdForget(args []string) error {
+func cmdForget(ctx context.Context, args []string) error {
 	fs := flag.NewFlagSet("forget", flag.ContinueOnError)
 	fs.SetOutput(os.Stderr)
 	var (

@@ -9,6 +9,7 @@ package mcp
 
 import (
 	"bufio"
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -60,7 +61,11 @@ func errf(code int, format string, args ...any) *rpcError {
 }
 
 // handler is one JSON-RPC method.
-type handler func(params json.RawMessage) (any, *rpcError)
+//
+// The context belongs to the one message being answered, not to the
+// connection: over HTTP it is the request's, so a client that hangs up
+// cancels the tool call it was waiting on.
+type handler func(ctx context.Context, params json.RawMessage) (any, *rpcError)
 
 // router maps methods to handlers. It is transport-agnostic on purpose: the
 // stdio connection and the HTTP endpoint dispatch through the same table, so
@@ -75,7 +80,7 @@ func (r *router) handle(method string, h handler) { r.handlers[method] = h }
 
 // dispatch runs one message. It returns nil when there is nothing to send
 // back, which is the case for a notification.
-func (r *router) dispatch(req *request) *response {
+func (r *router) dispatch(ctx context.Context, req *request) *response {
 	h, ok := r.handlers[req.Method]
 	if !ok {
 		if req.isNotification() {
@@ -86,7 +91,7 @@ func (r *router) dispatch(req *request) *response {
 		return &response{JSONRPC: "2.0", ID: req.ID, Error: errf(CodeMethodNotFound, "unknown method %q", req.Method)}
 	}
 
-	result, rpcErr := h(req.Params)
+	result, rpcErr := h(ctx, req.Params)
 	if req.isNotification() {
 		return nil
 	}
@@ -113,13 +118,17 @@ func newConn(in io.Reader, out io.Writer, r *router) *conn {
 	}
 }
 
-// serve reads messages until the input closes.
+// serve reads messages until the input closes, or the context is cancelled.
+//
+// Messages are answered one at a time, so the context handed to each is the
+// connection's: there is no second message waiting to be served while one is
+// in flight, and nothing to cancel a call individually with.
 //
 // Messages are newline-delimited JSON, which is what the stdio transport
 // specifies. A single message may be large -- a read of a big file comes back
 // this way -- so the reader is given room and long lines are accumulated
 // rather than truncated.
-func (c *conn) serve() error {
+func (c *conn) serve(ctx context.Context) error {
 	for {
 		line, err := c.readLine()
 		if errors.Is(err, io.EOF) {
@@ -139,7 +148,7 @@ func (c *conn) serve() error {
 			c.write(&response{JSONRPC: "2.0", Error: errf(CodeParseError, "invalid JSON: %v", err)})
 			continue
 		}
-		if resp := c.router.dispatch(&req); resp != nil {
+		if resp := c.router.dispatch(ctx, &req); resp != nil {
 			c.write(resp)
 		}
 	}

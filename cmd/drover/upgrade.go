@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"flag"
 	"fmt"
@@ -31,7 +32,7 @@ const repoSlug = "notshekhar/drover"
 // original method knows nothing about.
 const installMarker = ".install-method"
 
-func cmdUpgrade(args []string) error {
+func cmdUpgrade(ctx context.Context, args []string) error {
 	fs := flag.NewFlagSet("upgrade", flag.ContinueOnError)
 	fs.SetOutput(os.Stderr)
 	var (
@@ -50,7 +51,7 @@ func cmdUpgrade(args []string) error {
 	}
 
 	fmt.Printf("▶ Checking for updates (current %s)\n", Version)
-	latest, err := latestTag(slug)
+	latest, err := latestTag(ctx, slug)
 	switch {
 	case err != nil && *versionFlag == "":
 		// Not fatal: the installer resolves the tag itself, and a network
@@ -112,7 +113,7 @@ func reportCheck(latest string) error {
 // The releases/latest redirect is tried first because it is not subject to the
 // anonymous GitHub API rate limit (60 requests an hour per IP) that bites on
 // shared networks and in CI. The API is the fallback.
-func latestTag(slug string) (string, error) {
+func latestTag(ctx context.Context, slug string) (string, error) {
 	client := &http.Client{Timeout: 15 * time.Second}
 
 	resp, err := client.Head("https://github.com/" + slug + "/releases/latest")
@@ -123,7 +124,7 @@ func latestTag(slug string) (string, error) {
 		}
 	}
 
-	req, _ := http.NewRequest(http.MethodGet, "https://api.github.com/repos/"+slug+"/releases/latest", nil)
+	req, _ := http.NewRequestWithContext(ctx, http.MethodGet, "https://api.github.com/repos/"+slug+"/releases/latest", nil)
 	req.Header.Set("Accept", "application/vnd.github+json")
 	apiResp, apiErr := client.Do(req)
 	if apiErr != nil {

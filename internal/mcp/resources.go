@@ -1,6 +1,7 @@
 package mcp
 
 import (
+	"context"
 	"encoding/json"
 
 	"github.com/notshekhar/drover/internal/docs"
@@ -20,7 +21,7 @@ const (
 	uriInventory = "drover://inventory"
 )
 
-func (s *Server) listResources(json.RawMessage) (any, *rpcError) {
+func (s *Server) listResources(_ context.Context, _ json.RawMessage) (any, *rpcError) {
 	return map[string]any{"resources": []map[string]any{
 		{
 			"uri":         uriReference,
@@ -37,7 +38,7 @@ func (s *Server) listResources(json.RawMessage) (any, *rpcError) {
 	}}, nil
 }
 
-func (s *Server) readResource(params json.RawMessage) (any, *rpcError) {
+func (s *Server) readResource(ctx context.Context, params json.RawMessage) (any, *rpcError) {
 	var req struct {
 		URI string `json:"uri"`
 	}
@@ -54,7 +55,7 @@ func (s *Server) readResource(params json.RawMessage) (any, *rpcError) {
 		// docs.Markdown always matches the binary that is answering.
 		body = docs.Markdown
 	case uriInventory:
-		body = s.inventory()
+		body = s.inventory(ctx)
 		if body == "" {
 			body = "This engine holds nothing yet. Apply a Repository to give it something to serve; the drover://reference resource explains how."
 		}

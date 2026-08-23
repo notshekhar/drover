@@ -2,6 +2,7 @@ package mcp_test
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
@@ -20,6 +21,7 @@ func engine(t *testing.T, dataDir string) *httptest.Server {
 	}
 	srv := httptest.NewServer(eng.Handler())
 	t.Cleanup(srv.Close)
+	t.Cleanup(func() { _ = eng.Shutdown(context.Background()) })
 	return srv
 }
 

@@ -1,6 +1,7 @@
 package mcp
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -9,6 +10,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/notshekhar/drover/internal/activity"
 	"github.com/notshekhar/drover/internal/api"
 	"github.com/notshekhar/drover/internal/object"
 )
@@ -19,20 +21,24 @@ import (
 // wires it straight to its own store and executors, and `drover mcp`, which
 // wires it to an HTTP client pointed at an engine elsewhere. Without it the
 // in-process transport would have to call itself over loopback HTTP.
+// Every method takes a context because a tool call is cancellable: an HTTP
+// client that hangs up, or an agent that gives up on a slow grep, should stop
+// the work rather than leave it running against a machine nobody is waiting
+// on. It is also what carries who is calling, for the activity log.
 type Backend interface {
-	List(kind object.Kind) ([]api.ObjectView, error)
-	Get(kind object.Kind, name string) (*api.ObjectView, error)
+	List(ctx context.Context, kind object.Kind) ([]api.ObjectView, error)
+	Get(ctx context.Context, kind object.Kind, name string) (*api.ObjectView, error)
 
-	Ls(req api.LsRequest) (*api.LsResponse, error)
-	ReadFile(req api.ReadRequest) (*api.ReadResponse, error)
-	Grep(req api.GrepRequest) (*api.GrepResponse, error)
-	Find(req api.FindRequest) (*api.FindResponse, error)
+	Ls(ctx context.Context, req api.LsRequest) (*api.LsResponse, error)
+	ReadFile(ctx context.Context, req api.ReadRequest) (*api.ReadResponse, error)
+	Grep(ctx context.Context, req api.GrepRequest) (*api.GrepResponse, error)
+	Find(ctx context.Context, req api.FindRequest) (*api.FindResponse, error)
 
-	Git(req api.GitRequest) (*api.GitResponse, error)
-	LSP(req api.LSPRequest) (*api.LSPResponse, error)
+	Git(ctx context.Context, req api.GitRequest) (*api.GitResponse, error)
+	LSP(ctx context.Context, req api.LSPRequest) (*api.LSPResponse, error)
 
-	Call(name string, req api.CallRequest) (*api.CallResponse, error)
-	Query(name, query string) (*api.QueryResponse, error)
+	Call(ctx context.Context, name string, req api.CallRequest) (*api.CallResponse, error)
+	Query(ctx context.Context, name, query string) (*api.QueryResponse, error)
 }
 
 // ProtocolVersion is the MCP revision drover implements.
@@ -75,9 +81,19 @@ type Server struct {
 	// reach the client between requests. Its presence is what initialize
 	// consults before promising tools/listChanged.
 	notify    func(method string, params any)
+	watchCtx  context.Context
 	watchDone chan struct{}
-	watchMu   sync.Mutex
-	watching  bool
+
+	// hub is the HTTP transport's equivalent of notify: the GET event stream
+	// every listener is fanned out to. Set by HTTPHandler, so its presence is
+	// what tells initialize an HTTP client can be sent a notification.
+	hub      *hub
+	watchMu  sync.Mutex
+	watching bool
+
+	callerMu   sync.Mutex
+	clientName string
+	sessionID  string
 }
 
 // Tool is one advertised tool.
@@ -134,13 +150,13 @@ func (s *Server) router() *router {
 	r := newRouter()
 
 	r.handle("initialize", s.initialize)
-	r.handle("notifications/initialized", func(json.RawMessage) (any, *rpcError) {
+	r.handle("notifications/initialized", func(context.Context, json.RawMessage) (any, *rpcError) {
 		// The handshake is over, so a server-initiated message is now legal.
 		// Starting the watcher any earlier would put one in the middle of it.
 		s.startToolWatch()
 		return nil, nil
 	})
-	r.handle("ping", func(json.RawMessage) (any, *rpcError) { return map[string]any{}, nil })
+	r.handle("ping", func(context.Context, json.RawMessage) (any, *rpcError) { return map[string]any{}, nil })
 	r.handle("tools/list", s.listTools)
 	r.handle("tools/call", s.callTool)
 
@@ -151,7 +167,7 @@ func (s *Server) router() *router {
 	// method-not-found it has to special-case. Prompts are user-invoked, which
 	// makes them a good home for a canned investigation later; there is
 	// nothing to put there yet.
-	r.handle("prompts/list", func(json.RawMessage) (any, *rpcError) {
+	r.handle("prompts/list", func(context.Context, json.RawMessage) (any, *rpcError) {
 		return map[string]any{"prompts": []any{}}, nil
 	})
 	return r
@@ -164,7 +180,7 @@ func (s *Server) router() *router {
 // so it is the only one that advertises tools/listChanged. The notifier is
 // installed before the router is built, because initialize reads it to decide
 // what to promise.
-func (s *Server) Serve(in io.Reader, out io.Writer) error {
+func (s *Server) Serve(ctx context.Context, in io.Reader, out io.Writer) error {
 	c := newConn(in, out, nil)
 
 	done := make(chan struct{})
@@ -172,9 +188,10 @@ func (s *Server) Serve(in io.Reader, out io.Writer) error {
 
 	s.notify = c.notify
 	s.watchDone = done
+	s.watchCtx = ctx
 	c.router = s.router()
 
-	return c.serve()
+	return c.serve(ctx)
 }
 
 // startToolWatch launches the tool-list watcher, at most once per connection.
@@ -199,15 +216,52 @@ func (s *Server) startToolWatch() {
 	// An unreachable engine leaves this empty on purpose: the first successful
 	// read then becomes the baseline, rather than the jump from nothing to
 	// everything counting as a change.
-	baseline, _ := s.toolFingerprint()
-	go s.watchToolChanges(s.notify, baseline, s.watchDone)
+	// The watcher outlives the message that started it, so it takes the
+	// connection's context, not that message's. Only stdio gets here at all --
+	// the HTTP endpoint leaves notify nil and returns above -- so there is no
+	// case where this is a request context that dies in a second.
+	ctx := s.watchCtx
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	baseline, _ := s.toolFingerprint(ctx)
+	go s.watchToolChanges(ctx, s.notify, baseline, s.watchDone, nil)
 }
 
-func (s *Server) initialize(params json.RawMessage) (any, *rpcError) {
+func (s *Server) caller() activity.Caller {
+	s.callerMu.Lock()
+	defer s.callerMu.Unlock()
+	src := "mcp-http"
+	if s.notify != nil {
+		src = "mcp-stdio"
+	}
+	return activity.Caller{Source: src, Client: s.clientName, Session: s.sessionID}
+}
+
+func (s *Server) initialize(ctx context.Context, params json.RawMessage) (any, *rpcError) {
 	var req struct {
 		ProtocolVersion string `json:"protocolVersion"`
+		ClientInfo      struct {
+			Name    string `json:"name"`
+			Version string `json:"version"`
+		} `json:"clientInfo"`
 	}
 	_ = json.Unmarshal(params, &req)
+
+	client := strings.TrimSpace(req.ClientInfo.Name)
+	if v := strings.TrimSpace(req.ClientInfo.Version); v != "" && client != "" {
+		client = client + "/" + v
+	}
+	session := activity.NewSession()
+	s.callerMu.Lock()
+	s.clientName = client
+	s.sessionID = session
+	s.callerMu.Unlock()
+	if a, ok := s.Backend.(interface {
+		SetAttribution(client, session, via string)
+	}); ok {
+		a.SetAttribution(client, session, "stdio")
+	}
 
 	version := ProtocolVersion
 	if supportedVersions[req.ProtocolVersion] {
@@ -215,12 +269,13 @@ func (s *Server) initialize(params json.RawMessage) (any, *rpcError) {
 	}
 
 	// listChanged is a promise to send notifications/tools/list_changed, and
-	// only the stdio transport can keep it: the HTTP endpoint has no
-	// server-initiated stream, so a client there has nowhere to receive one.
-	// Advertising it on both would leave an HTTP client waiting for a message
-	// that can never arrive, and re-listing only when it happens to reconnect.
+	// both transports can now keep it: stdio writes down its own pipe, and
+	// HTTP writes down the GET event stream. The promise is still conditional
+	// rather than hardcoded, because a Server built without either -- a test,
+	// an in-process caller -- would otherwise leave a client waiting for a
+	// message that can never arrive.
 	tools := map[string]any{}
-	if s.notify != nil {
+	if s.notify != nil || s.hub != nil {
 		tools["listChanged"] = true
 	}
 
@@ -235,7 +290,7 @@ func (s *Server) initialize(params json.RawMessage) (any, *rpcError) {
 			"name":    "drover",
 			"version": s.Version,
 		},
-		"instructions": s.instructions(),
+		"instructions": s.instructions(ctx),
 	}, nil
 }
 
@@ -245,8 +300,8 @@ func (s *Server) initialize(params json.RawMessage) (any, *rpcError) {
 // The two halves are different in kind. The first never changes and explains
 // which tool answers which question; the second is knowable only by a running
 // engine, and is the half that saves an agent its first round trip.
-func (s *Server) instructions() string {
-	inv := s.inventory()
+func (s *Server) instructions(ctx context.Context) string {
+	inv := s.inventory(ctx)
 	if inv == "" {
 		return instructions
 	}
@@ -290,12 +345,12 @@ For databases: sql_query runs one read-only statement against a named connection
 // requests became twenty tools, every one of them re-sent on every tools/list
 // and all of them competing for the model's attention. The catalogue belongs
 // in a tool's arguments, not in the tool list.
-func (s *Server) listTools(json.RawMessage) (any, *rpcError) {
+func (s *Server) listTools(ctx context.Context, _ json.RawMessage) (any, *rpcError) {
 	tools := append([]Tool(nil), fileTools...)
-	tools = append(tools, s.gitTools()...)
-	tools = append(tools, s.lspTools()...)
-	tools = append(tools, s.apiTools()...)
-	tools = append(tools, s.sqlTools()...)
+	tools = append(tools, s.gitTools(ctx)...)
+	tools = append(tools, s.lspTools(ctx)...)
+	tools = append(tools, s.apiTools(ctx)...)
+	tools = append(tools, s.sqlTools(ctx)...)
 	return map[string]any{"tools": tools}, nil
 }
 
@@ -363,8 +418,8 @@ var fileTools = []Tool{
 //
 // api_call's description stays the same length whether one request is
 // configured or two hundred; discovery happens through api_list.
-func (s *Server) apiTools() []Tool {
-	count, envs := s.apiCounts()
+func (s *Server) apiTools(ctx context.Context) []Tool {
+	count, envs := s.apiCounts(ctx)
 	if count == 0 {
 		// Nothing configured: advertising tools that can only fail wastes a
 		// slot and invites the model to try them.
@@ -427,8 +482,8 @@ func (s *Server) apiTools() []Tool {
 
 // apiCounts reports how many callable requests and environments exist, which
 // is what the api_list description quotes.
-func (s *Server) apiCounts() (requests, environments int) {
-	items, err := s.Backend.List(object.KindHTTPRequest)
+func (s *Server) apiCounts(ctx context.Context) (requests, environments int) {
+	items, err := s.Backend.List(ctx, object.KindHTTPRequest)
 	if err != nil {
 		return 0, 0
 	}
@@ -437,7 +492,7 @@ func (s *Server) apiCounts() (requests, environments int) {
 			requests++
 		}
 	}
-	if envs, err := s.Backend.List(object.KindEnvironment); err == nil {
+	if envs, err := s.Backend.List(ctx, object.KindEnvironment); err == nil {
 		environments = len(envs)
 	}
 	return requests, environments
@@ -445,8 +500,8 @@ func (s *Server) apiCounts() (requests, environments int) {
 
 // sqlTools is loop's shape: one query tool, with the catalogue of connections
 // in its description so the model can pick the right one.
-func (s *Server) sqlTools() []Tool {
-	items, err := s.Backend.List(object.KindSQLConnection)
+func (s *Server) sqlTools(ctx context.Context) []Tool {
+	items, err := s.Backend.List(ctx, object.KindSQLConnection)
 	if err != nil {
 		return nil
 	}

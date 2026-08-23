@@ -12,12 +12,16 @@ import (
 	"github.com/notshekhar/drover/internal/git"
 	"github.com/notshekhar/drover/internal/httpreq"
 	"github.com/notshekhar/drover/internal/lsp"
+	"github.com/notshekhar/drover/internal/mcp"
 	"github.com/notshekhar/drover/internal/object"
 	"github.com/notshekhar/drover/internal/store"
 )
 
 // backend implements mcp.Backend directly against this server's own store and
-// executors.
+// executors, and is the one path every tool call takes. The REST handlers are
+// adapters over it rather than a second implementation: two copies of "run a
+// grep and shape the response" is two places for the answer to drift, and one
+// place is what makes a single wrapper able to see every call.
 //
 // The alternative -- having the /mcp endpoint call the engine's own HTTP API
 // over loopback -- would work, but it makes every tool call a second network
@@ -27,9 +31,14 @@ type backend struct{ s *Server }
 
 // Backend returns an mcp.Backend over this server. It is exported so the MCP
 // endpoint and any in-process caller share one implementation.
-func (s *Server) Backend() *backend { return &backend{s: s} }
+func (s *Server) Backend() mcp.Backend {
+	if s.exec != nil {
+		return s.exec
+	}
+	return &backend{s: s}
+}
 
-func (b *backend) List(kind object.Kind) ([]api.ObjectView, error) {
+func (b *backend) List(_ context.Context, kind object.Kind) ([]api.ObjectView, error) {
 	objs, err := b.s.store.List(kind)
 	if err != nil {
 		return nil, err
@@ -41,7 +50,7 @@ func (b *backend) List(kind object.Kind) ([]api.ObjectView, error) {
 	return out, nil
 }
 
-func (b *backend) Get(kind object.Kind, name string) (*api.ObjectView, error) {
+func (b *backend) Get(_ context.Context, kind object.Kind, name string) (*api.ObjectView, error) {
 	o, err := b.s.store.Get(kind, name)
 	if err != nil {
 		return nil, err
@@ -50,7 +59,7 @@ func (b *backend) Get(kind object.Kind, name string) (*api.ObjectView, error) {
 	return &v, nil
 }
 
-func (b *backend) Ls(req api.LsRequest) (*api.LsResponse, error) {
+func (b *backend) Ls(_ context.Context, req api.LsRequest) (*api.LsResponse, error) {
 	res, err := b.s.files.List(req.Path)
 	if err != nil {
 		return nil, err
@@ -62,7 +71,7 @@ func (b *backend) Ls(req api.LsRequest) (*api.LsResponse, error) {
 	return out, nil
 }
 
-func (b *backend) ReadFile(req api.ReadRequest) (*api.ReadResponse, error) {
+func (b *backend) ReadFile(_ context.Context, req api.ReadRequest) (*api.ReadResponse, error) {
 	res, err := b.s.files.Read(req.Path, req.Offset, req.Limit)
 	if err != nil {
 		return nil, err
@@ -77,8 +86,8 @@ func (b *backend) ReadFile(req api.ReadRequest) (*api.ReadResponse, error) {
 	}, nil
 }
 
-func (b *backend) Grep(req api.GrepRequest) (*api.GrepResponse, error) {
-	res, err := b.s.files.Grep(req.Pattern, files.GrepOptions{
+func (b *backend) Grep(ctx context.Context, req api.GrepRequest) (*api.GrepResponse, error) {
+	res, err := b.s.files.Grep(ctx, req.Pattern, files.GrepOptions{
 		Path:          req.Path,
 		Include:       req.Include,
 		CaseSensitive: req.CaseSensitive,
@@ -94,24 +103,24 @@ func (b *backend) Grep(req api.GrepRequest) (*api.GrepResponse, error) {
 	return out, nil
 }
 
-func (b *backend) Find(req api.FindRequest) (*api.FindResponse, error) {
-	res, err := b.s.files.Find(req.Pattern, req.Path, req.MaxResults)
+func (b *backend) Find(ctx context.Context, req api.FindRequest) (*api.FindResponse, error) {
+	res, err := b.s.files.Find(ctx, req.Pattern, req.Path, req.MaxResults)
 	if err != nil {
 		return nil, err
 	}
 	return &api.FindResponse{Paths: res.Paths, Truncated: res.Truncated}, nil
 }
 
-func (b *backend) Call(name string, req api.CallRequest) (*api.CallResponse, error) {
-	return b.s.callRequest(context.Background(), name, req)
+func (b *backend) Call(ctx context.Context, name string, req api.CallRequest) (*api.CallResponse, error) {
+	return b.s.callRequest(ctx, name, req)
 }
 
-func (b *backend) Query(name, query string) (*api.QueryResponse, error) {
+func (b *backend) Query(ctx context.Context, name, query string) (*api.QueryResponse, error) {
 	spec, err := b.s.sqlSpecFor(name)
 	if err != nil {
 		return nil, err
 	}
-	res, err := b.s.sql.Query(context.Background(), name, spec, query)
+	res, err := b.s.sql.Query(ctx, name, spec, query)
 	if err != nil {
 		return nil, err
 	}
@@ -203,8 +212,8 @@ func unsupportedMethod(err error) bool {
 
 // --- git ---
 
-func (b *backend) Git(req api.GitRequest) (*api.GitResponse, error) {
-	return b.s.gitQuery(context.Background(), req)
+func (b *backend) Git(ctx context.Context, req api.GitRequest) (*api.GitResponse, error) {
+	return b.s.gitQuery(ctx, req)
 }
 
 // gitQuery runs one history operation and converts the engine's result to the
@@ -332,8 +341,8 @@ func gitErrStatus(err error) int {
 
 // --- lsp ---
 
-func (b *backend) LSP(req api.LSPRequest) (*api.LSPResponse, error) {
-	return b.s.lspQuery(context.Background(), req)
+func (b *backend) LSP(ctx context.Context, req api.LSPRequest) (*api.LSPResponse, error) {
+	return b.s.lspQuery(ctx, req)
 }
 
 // lspQuery answers one navigation question.

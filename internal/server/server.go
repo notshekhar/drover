@@ -20,6 +20,7 @@ import (
 
 	"gopkg.in/yaml.v3"
 
+	"github.com/notshekhar/drover/internal/activity"
 	"github.com/notshekhar/drover/internal/api"
 	"github.com/notshekhar/drover/internal/config"
 	"github.com/notshekhar/drover/internal/docs"
@@ -33,6 +34,7 @@ import (
 	"github.com/notshekhar/drover/internal/sqldb"
 	"github.com/notshekhar/drover/internal/store"
 	syncmgr "github.com/notshekhar/drover/internal/sync"
+	"github.com/notshekhar/drover/internal/web"
 )
 
 // Options configure a server.
@@ -69,16 +71,22 @@ type Options struct {
 
 // Server is the engine.
 type Server struct {
-	opts  Options
-	store *store.Store
-	repo  *repo.Reconciler
-	sync  *syncmgr.Manager
-	http  *httpreq.Executor
-	sql   *sqldb.Pool
-	files *files.Root
-	git   *git.Repos
-	lsp   *lsp.Manager
-	mux   *http.ServeMux
+	opts   Options
+	store  *store.Store
+	repo   *repo.Reconciler
+	sync   *syncmgr.Manager
+	http   *httpreq.Executor
+	sql    *sqldb.Pool
+	files  *files.Root
+	git    *git.Repos
+	lsp    *lsp.Manager
+	ledger *activity.Ledger
+	exec   mcp.Backend
+	mux    *http.ServeMux
+	// handler is the mux behind the guard, and is the only thing anything
+	// serves. Keeping the bare mux reachable is how the guard came to be
+	// applied to Handler() and not to Serve(): one field, one answer.
+	handler http.Handler
 
 	started time.Time
 
@@ -140,6 +148,21 @@ func New(opts Options) (*Server, error) {
 			OnCommitChanged: s.restartLanguageServers,
 		})
 	}
+
+	led, err := activity.Open(filepath.Join(opts.DataDir, activity.FileName))
+	if err != nil {
+		return nil, err
+	}
+	s.ledger = led
+	s.exec = &recordingBackend{
+		inner: &backend{s: s},
+		rec:   led,
+		knows: func(name string) bool {
+			_, err := s.store.Get(object.KindRepository, name)
+			return err == nil
+		},
+	}
+
 	s.routes()
 	return s, nil
 }
@@ -158,8 +181,9 @@ func (s *Server) restartLanguageServers(repository string) {
 func (s *Server) Store() *store.Store { return s.store }
 
 // Handler is the HTTP handler, exported so tests can drive it without a
-// listener.
-func (s *Server) Handler() http.Handler { return s.mux }
+// listener. It is what Serve listens with, so a test drives exactly what a
+// client would reach.
+func (s *Server) Handler() http.Handler { return s.handler }
 
 func (s *Server) logf(format string, args ...any) {
 	fmt.Fprintf(s.opts.Log, format+"\n", args...)
@@ -178,11 +202,16 @@ func (s *Server) routes() {
 	mcpHandler := (&mcp.Server{Backend: s.Backend(), Version: s.opts.Version}).HTTPHandler()
 	s.mux.Handle(MCPPath, mcpHandler)
 	s.mux.Handle(MCPPath+"/", mcpHandler)
+	s.mux.Handle(web.Path, web.Handler())
+	s.mux.Handle(web.Path+"/", web.Handler())
 	s.mux.HandleFunc("POST "+api.Prefix+"/apply", s.handleApply)
 	s.mux.HandleFunc("GET "+api.Prefix+"/status", s.handleStatus)
 	s.mux.HandleFunc("POST "+api.Prefix+"/repositories/{name}/sync", s.handleSyncOne)
 	s.mux.HandleFunc("POST "+api.Prefix+"/sync", s.handleSyncAll)
 	s.mux.HandleFunc("GET "+api.Prefix+"/dashboard", s.handleDashboard)
+	s.mux.HandleFunc("GET "+api.Prefix+"/activity", s.handleActivity)
+	s.mux.HandleFunc("GET "+api.Prefix+"/activity/stats", s.handleActivityStats)
+	s.mux.HandleFunc("GET "+api.Prefix+"/activity/{id}", s.handleActivityGet)
 	s.mux.HandleFunc("POST "+api.Prefix+"/reload", s.handleReload)
 	s.mux.HandleFunc("POST "+api.Prefix+"/files/ls", s.handleLs)
 	s.mux.HandleFunc("POST "+api.Prefix+"/files/read", s.handleRead)
@@ -202,6 +231,10 @@ func (s *Server) routes() {
 		s.mux.HandleFunc("PUT "+p+"/{name}", func(w http.ResponseWriter, r *http.Request) { s.handlePut(w, r, kind) })
 		s.mux.HandleFunc("DELETE "+p+"/{name}", func(w http.ResponseWriter, r *http.Request) { s.handleDelete(w, r, kind) })
 	}
+
+	// Nothing serves the bare mux. Everything -- the listener, the tests --
+	// goes through Handler(), which is this.
+	s.handler = guard(s.mux)
 }
 
 // Bootstrap loads what is already on disk, then applies the config's apply:
@@ -417,7 +450,7 @@ func isAddrInUse(err error) bool {
 // ErrServerClosed rather than a failure.
 func (s *Server) Serve(ln net.Listener) error {
 	srv := &http.Server{
-		Handler:           s.mux,
+		Handler:           s.Handler(),
 		ReadHeaderTimeout: 10 * time.Second,
 	}
 	s.mu.Lock()
@@ -456,7 +489,69 @@ func (s *Server) Shutdown(ctx context.Context) error {
 	// Workers and database connections come after the listener, so nothing
 	// new can arrive while they are being torn down.
 	s.StopSync()
+	s.sql.Close()
+	_ = s.ledger.Close()
 	return err
+}
+
+func (s *Server) attrCtx(r *http.Request) context.Context {
+	return activity.WithCaller(r.Context(), activity.CallerFromHTTP(r))
+}
+
+// activityFilter reads a filter off the query string. The list endpoint and
+// the stats endpoint parse it identically -- the dashboard sends one filter
+// to both and the two answers have to be about the same set of calls.
+func activityFilter(r *http.Request) activity.Filter {
+	q := r.URL.Query()
+	limit, _ := strconv.Atoi(q.Get("limit"))
+	return activity.Filter{
+		Limit:      limit,
+		Tool:       q.Get("tool"),
+		Source:     q.Get("source"),
+		Session:    q.Get("session"),
+		Repository: q.Get("repository"),
+		Outcome:    q.Get("outcome"),
+		Object:     q.Get("object"),
+		Q:          q.Get("q"),
+		Before:     q.Get("before"),
+		Sort:       q.Get("sort"),
+	}
+}
+
+func (s *Server) handleActivity(w http.ResponseWriter, r *http.Request) {
+	items, err := s.ledger.List(r.Context(), activityFilter(r))
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, err)
+		return
+	}
+	if items == nil {
+		items = []activity.Record{}
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"items": items})
+}
+
+// handleActivityStats answers "what is in the set I am looking at" -- the
+// counts the dashboard draws as filter chips.
+func (s *Server) handleActivityStats(w http.ResponseWriter, r *http.Request) {
+	st, err := s.ledger.Stats(r.Context(), activityFilter(r))
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, st)
+}
+
+func (s *Server) handleActivityGet(w http.ResponseWriter, r *http.Request) {
+	rec, err := s.ledger.Get(r.Context(), r.PathValue("id"))
+	if errors.Is(err, activity.ErrNotFound) {
+		writeErr(w, http.StatusNotFound, err)
+		return
+	}
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, rec)
 }
 
 // --- handlers ---
@@ -736,21 +831,23 @@ func fileErrStatus(err error) int {
 	return http.StatusBadRequest
 }
 
+// The four file handlers are adapters over the backend, not a second
+// implementation of it: decode, delegate, map the error to a status. The
+// stdio bridge reaches the file tools through here while the in-process /mcp
+// endpoint reaches them through the backend directly, and the two must not be
+// able to answer the same question differently.
+
 func (s *Server) handleLs(w http.ResponseWriter, r *http.Request) {
 	var req api.LsRequest
 	if !decodeBody(w, r, &req) {
 		return
 	}
-	res, err := s.files.List(req.Path)
+	res, err := s.Backend().Ls(s.attrCtx(r), req)
 	if err != nil {
 		writeErr(w, fileErrStatus(err), err)
 		return
 	}
-	out := api.LsResponse{Path: res.Path, Entries: []api.FileEntry{}, Truncated: res.Truncated}
-	for _, e := range res.Entries {
-		out.Entries = append(out.Entries, api.FileEntry{Name: e.Name, Path: e.Path, Type: e.Type, Size: e.Size})
-	}
-	writeJSON(w, http.StatusOK, out)
+	writeJSON(w, http.StatusOK, res)
 }
 
 func (s *Server) handleRead(w http.ResponseWriter, r *http.Request) {
@@ -758,19 +855,12 @@ func (s *Server) handleRead(w http.ResponseWriter, r *http.Request) {
 	if !decodeBody(w, r, &req) {
 		return
 	}
-	res, err := s.files.Read(req.Path, req.Offset, req.Limit)
+	res, err := s.Backend().ReadFile(s.attrCtx(r), req)
 	if err != nil {
 		writeErr(w, fileErrStatus(err), err)
 		return
 	}
-	writeJSON(w, http.StatusOK, api.ReadResponse{
-		Path:       res.Path,
-		Content:    res.Content,
-		StartLine:  res.StartLine,
-		EndLine:    res.EndLine,
-		TotalLines: res.TotalLines,
-		Truncated:  res.Truncated,
-	})
+	writeJSON(w, http.StatusOK, res)
 }
 
 func (s *Server) handleGrep(w http.ResponseWriter, r *http.Request) {
@@ -778,21 +868,12 @@ func (s *Server) handleGrep(w http.ResponseWriter, r *http.Request) {
 	if !decodeBody(w, r, &req) {
 		return
 	}
-	res, err := s.files.Grep(req.Pattern, files.GrepOptions{
-		Path:          req.Path,
-		Include:       req.Include,
-		CaseSensitive: req.CaseSensitive,
-		MaxResults:    req.MaxResults,
-	})
+	res, err := s.Backend().Grep(s.attrCtx(r), req)
 	if err != nil {
 		writeErr(w, fileErrStatus(err), err)
 		return
 	}
-	out := api.GrepResponse{Matches: []api.GrepMatch{}, Files: res.Files, Truncated: res.Truncated}
-	for _, m := range res.Matches {
-		out.Matches = append(out.Matches, api.GrepMatch{Path: m.Path, Line: m.Line, Text: m.Text})
-	}
-	writeJSON(w, http.StatusOK, out)
+	writeJSON(w, http.StatusOK, res)
 }
 
 func (s *Server) handleFind(w http.ResponseWriter, r *http.Request) {
@@ -800,12 +881,12 @@ func (s *Server) handleFind(w http.ResponseWriter, r *http.Request) {
 	if !decodeBody(w, r, &req) {
 		return
 	}
-	res, err := s.files.Find(req.Pattern, req.Path, req.MaxResults)
+	res, err := s.Backend().Find(s.attrCtx(r), req)
 	if err != nil {
 		writeErr(w, fileErrStatus(err), err)
 		return
 	}
-	writeJSON(w, http.StatusOK, api.FindResponse{Paths: res.Paths, Truncated: res.Truncated})
+	writeJSON(w, http.StatusOK, res)
 }
 
 // handleGit answers one history question about a checkout.
@@ -814,7 +895,7 @@ func (s *Server) handleGit(w http.ResponseWriter, r *http.Request) {
 	if !decodeBody(w, r, &req) {
 		return
 	}
-	res, err := s.gitQuery(r.Context(), req)
+	res, err := s.Backend().Git(s.attrCtx(r), req)
 	if err != nil {
 		writeErr(w, gitErrStatus(err), err)
 		return
@@ -828,7 +909,7 @@ func (s *Server) handleLSP(w http.ResponseWriter, r *http.Request) {
 	if !decodeBody(w, r, &req) {
 		return
 	}
-	res, err := s.lspQuery(r.Context(), req)
+	res, err := s.Backend().LSP(s.attrCtx(r), req)
 	if err != nil {
 		writeErr(w, lspErrStatus(err), err)
 		return
@@ -848,7 +929,7 @@ func (s *Server) handleCall(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	resp, err := s.callRequest(r.Context(), name, req)
+	resp, err := s.Backend().Call(s.attrCtx(r), name, req)
 	if err != nil {
 		writeErr(w, callErrStatus(err), err)
 		return
@@ -867,8 +948,7 @@ func callErrStatus(err error) int {
 // handleQuery runs one statement against a SQLConnection.
 func (s *Server) handleQuery(w http.ResponseWriter, r *http.Request) {
 	name := r.PathValue("name")
-	spec, ok := s.sqlSpec(w, name)
-	if !ok {
+	if _, ok := s.sqlSpec(w, name); !ok {
 		return
 	}
 
@@ -882,19 +962,16 @@ func (s *Server) handleQuery(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	res, err := s.sql.Query(r.Context(), name, spec, req.Query)
+	res, err := s.Backend().Query(s.attrCtx(r), name, req.Query)
 	if err != nil {
+		if isNotFound(err) {
+			writeErr(w, http.StatusNotFound, err)
+			return
+		}
 		writeErr(w, http.StatusBadRequest, err)
 		return
 	}
-	writeJSON(w, http.StatusOK, api.QueryResponse{
-		Columns:   res.Columns,
-		Rows:      res.Rows,
-		RowCount:  res.RowCount,
-		Truncated: res.Truncated,
-		Provider:  res.Provider,
-		ElapsedMS: res.Elapsed,
-	})
+	writeJSON(w, http.StatusOK, res)
 }
 
 // handleHealth re-runs the health gate on demand.

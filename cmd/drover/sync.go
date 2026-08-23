@@ -1,12 +1,13 @@
 package main
 
 import (
+	"context"
 	"flag"
 	"fmt"
 	"os"
 )
 
-func cmdSync(args []string) error {
+func cmdSync(ctx context.Context, args []string) error {
 	fs := flag.NewFlagSet("sync", flag.ContinueOnError)
 	fs.SetOutput(os.Stderr)
 	var (
@@ -28,13 +29,13 @@ func cmdSync(args []string) error {
 	// blocking the CLI on it would be worse than letting `get` report the
 	// phase.
 	if len(rest) == 0 {
-		if err := c.SyncAll(); err != nil {
+		if err := c.SyncAll(ctx); err != nil {
 			return err
 		}
 		fmt.Println("refresh queued for every repository; watch it with `drover get repository`")
 		return nil
 	}
-	if err := c.Sync(rest[0]); err != nil {
+	if err := c.Sync(ctx, rest[0]); err != nil {
 		return err
 	}
 	fmt.Printf("refresh queued for %s\n", rest[0])

@@ -15,9 +15,11 @@ import (
 	"testing"
 	"time"
 
+	"github.com/notshekhar/drover/internal/activity"
 	"github.com/notshekhar/drover/internal/api"
 	"github.com/notshekhar/drover/internal/config"
 	"github.com/notshekhar/drover/internal/object"
+	"github.com/notshekhar/drover/internal/web"
 )
 
 const repoDoc = `apiVersion: drover/v1
@@ -36,6 +38,7 @@ func newServer(t *testing.T) (*Server, string) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	t.Cleanup(func() { _ = s.ledger.Close() })
 	return s, dir
 }
 
@@ -46,6 +49,7 @@ func apply(t *testing.T, s *Server, docs ...api.Document) (*httptest.ResponseRec
 		t.Fatal(err)
 	}
 	req := httptest.NewRequest(http.MethodPost, api.Prefix+"/apply", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
 	rec := httptest.NewRecorder()
 	s.Handler().ServeHTTP(rec, req)
 
@@ -267,6 +271,7 @@ func TestPutRouteChecksNameAndKind(t *testing.T) {
 
 	// name in the path disagrees with the document
 	req := httptest.NewRequest(http.MethodPut, api.Prefix+"/repositories/web", strings.NewReader(repoDoc))
+	req.Header.Set("Content-Type", "application/json")
 	rec := httptest.NewRecorder()
 	s.Handler().ServeHTTP(rec, req)
 	if rec.Code != http.StatusBadRequest {
@@ -275,6 +280,7 @@ func TestPutRouteChecksNameAndKind(t *testing.T) {
 
 	// kind in the path disagrees with the document
 	req = httptest.NewRequest(http.MethodPut, api.Prefix+"/environments/api", strings.NewReader(repoDoc))
+	req.Header.Set("Content-Type", "application/json")
 	rec = httptest.NewRecorder()
 	s.Handler().ServeHTTP(rec, req)
 	if rec.Code != http.StatusBadRequest {
@@ -283,6 +289,7 @@ func TestPutRouteChecksNameAndKind(t *testing.T) {
 
 	// matching
 	req = httptest.NewRequest(http.MethodPut, api.Prefix+"/repositories/api", strings.NewReader(repoDoc))
+	req.Header.Set("Content-Type", "application/json")
 	rec = httptest.NewRecorder()
 	s.Handler().ServeHTTP(rec, req)
 	if rec.Code != http.StatusOK {
@@ -753,6 +760,7 @@ func TestLSPServersOperation(t *testing.T) {
 
 	req := httptest.NewRequest(http.MethodPost, api.Prefix+"/lsp",
 		strings.NewReader(`{"operation":"servers"}`))
+	req.Header.Set("Content-Type", "application/json")
 	rec := httptest.NewRecorder()
 	srv.Handler().ServeHTTP(rec, req)
 
@@ -828,5 +836,251 @@ spec:
 	}
 	if s.sql.Pooled("prod") {
 		t.Error("deleting the object left its connection open")
+	}
+}
+
+// The attack this closes: a page you visit issues a cross-origin form post
+// with enctype="text/plain", whose body happens to be JSON, and registers a
+// Repository in your engine. It is a simple request, so the browser sends it
+// without asking permission first. The reply is unreadable cross-origin, which
+// made it blind, not harmless -- it was still a write straight into the store.
+func TestCrossOriginWriteIsRefused(t *testing.T) {
+	s, _ := newServer(t)
+
+	doc := `{"documents":[{"source":"/evil.yaml","data":"apiVersion: drover/v1\nkind: Repository\nmetadata:\n  name: pwned\nspec:\n  url: https://example.com/x\n  branch: main\n"}]}`
+
+	// What a form post looks like on the wire: a simple content type, and an
+	// Origin the browser attaches for us.
+	req := httptest.NewRequest(http.MethodPost, api.Prefix+"/apply", strings.NewReader(doc))
+	req.Header.Set("Content-Type", "text/plain;charset=UTF-8")
+	req.Header.Set("Origin", "https://evil.example")
+	rec := httptest.NewRecorder()
+	s.Handler().ServeHTTP(rec, req)
+
+	if rec.Code == http.StatusOK {
+		t.Fatalf("a cross-origin form post applied an object")
+	}
+
+	// And it is refused on the content type alone, without an Origin -- that
+	// is what forces a real browser to preflight, where the Origin check gets
+	// its turn.
+	req = httptest.NewRequest(http.MethodPost, api.Prefix+"/apply", strings.NewReader(doc))
+	req.Header.Set("Content-Type", "text/plain;charset=UTF-8")
+	rec = httptest.NewRecorder()
+	s.Handler().ServeHTTP(rec, req)
+	if rec.Code != http.StatusUnsupportedMediaType {
+		t.Fatalf("status %d, want 415 for a non-JSON body", rec.Code)
+	}
+
+	// Nothing reached the store either way.
+	rec = httptest.NewRecorder()
+	s.Handler().ServeHTTP(rec, httptest.NewRequest(http.MethodGet, api.Prefix+"/repositories", nil))
+	if strings.Contains(rec.Body.String(), "pwned") {
+		t.Fatalf("the object was stored: %s", rec.Body)
+	}
+}
+
+// A browser-issued read is refused for the same reason: without this, a page
+// could drive the API and learn every repository the engine holds.
+func TestCrossOriginReadIsRefused(t *testing.T) {
+	s, _ := newServer(t)
+
+	req := httptest.NewRequest(http.MethodGet, api.Prefix+"/repositories", nil)
+	req.Header.Set("Origin", "https://evil.example")
+	rec := httptest.NewRecorder()
+	s.Handler().ServeHTTP(rec, req)
+	if rec.Code != http.StatusForbidden {
+		t.Fatalf("status %d, want 403 for a foreign origin", rec.Code)
+	}
+
+	// A loopback page is a legitimate local client, and no Origin at all is a
+	// direct client like the CLI.
+	for _, origin := range []string{"", "http://localhost:7432", "http://127.0.0.1:3000"} {
+		req := httptest.NewRequest(http.MethodGet, api.Prefix+"/repositories", nil)
+		if origin != "" {
+			req.Header.Set("Origin", origin)
+		}
+		rec := httptest.NewRecorder()
+		s.Handler().ServeHTTP(rec, req)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("origin %q: status %d, want 200", origin, rec.Code)
+		}
+	}
+}
+
+// This one goes over a real listener on purpose.
+//
+// The guard shipped applied to Handler() while Serve() listened with the bare
+// mux, so every test passed and a running engine was still wide open -- the
+// attack in TestCrossOriginWriteIsRefused succeeded against a live `drover
+// serve` while its own test was green. Driving Handler() cannot see that
+// class of bug; only going through the door a client uses can.
+func TestServeListensWithTheGuardedHandler(t *testing.T) {
+	s, _ := newServer(t)
+
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	go func() { _ = s.Serve(ln) }()
+	t.Cleanup(func() { _ = s.Shutdown(context.Background()) })
+
+	base := "http://" + ln.Addr().String()
+
+	req, err := http.NewRequest(http.MethodGet, base+api.Prefix+"/repositories", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set("Origin", "https://evil.example")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusForbidden {
+		t.Fatalf("a foreign origin got %d over a real listener, want 403 -- Serve is not using the guard", resp.StatusCode)
+	}
+}
+
+func TestToolCallLandsInActivityLedger(t *testing.T) {
+	s, dir := newServer(t)
+
+	body := `{"pattern":"no-such-token-xyz"}`
+	req := httptest.NewRequest(http.MethodPost, api.Prefix+"/files/grep", strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	s.Handler().ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK && rec.Code != http.StatusBadRequest && rec.Code != http.StatusForbidden {
+		t.Fatalf("grep status %d: %s", rec.Code, rec.Body)
+	}
+
+	req = httptest.NewRequest(http.MethodGet, api.Prefix+"/activity", nil)
+	rec = httptest.NewRecorder()
+	s.Handler().ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("activity status %d: %s", rec.Code, rec.Body)
+	}
+	var out struct {
+		Items []activity.Record `json:"items"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &out); err != nil {
+		t.Fatal(err)
+	}
+	if len(out.Items) != 1 {
+		t.Fatalf("ledger has %d rows, want 1: %s", len(out.Items), rec.Body)
+	}
+	got := out.Items[0]
+	if got.Tool != "grep" {
+		t.Errorf("tool = %q", got.Tool)
+	}
+	if got.Source != "cli" {
+		t.Errorf("source = %q, want cli for a REST call with no attribution headers", got.Source)
+	}
+	if got.Outcome == "" {
+		t.Error("outcome was empty")
+	}
+	if _, err := os.Stat(filepath.Join(dir, activity.FileName)); err != nil {
+		t.Fatalf("activity.db was not written to the data dir: %v", err)
+	}
+
+	req = httptest.NewRequest(http.MethodGet, api.Prefix+"/activity/"+got.ID, nil)
+	rec = httptest.NewRecorder()
+	s.Handler().ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("activity by id status %d: %s", rec.Code, rec.Body)
+	}
+}
+
+func TestDashboardHTMLIsServed(t *testing.T) {
+	s, _ := newServer(t)
+	req := httptest.NewRequest(http.MethodGet, web.Path, nil)
+	rec := httptest.NewRecorder()
+	s.Handler().ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status %d: %s", rec.Code, rec.Body)
+	}
+	if got := rec.Header().Get("Content-Security-Policy"); got != "default-src 'self'" {
+		t.Errorf("CSP = %q", got)
+	}
+	if !strings.Contains(rec.Header().Get("Content-Type"), "text/html") {
+		t.Errorf("Content-Type = %q", rec.Header().Get("Content-Type"))
+	}
+}
+
+// The first segment of a file path is only a repository if one is actually
+// called that. Without the check the log grows fictional repositories, and
+// the dashboard offers them as filters that lead to a 404.
+func TestActivityDoesNotInventRepositories(t *testing.T) {
+	s, _ := newServer(t)
+
+	body := `{"path":"no/such/file.go"}`
+	req := httptest.NewRequest(http.MethodPost, api.Prefix+"/files/read", strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	s.Handler().ServeHTTP(rec, req)
+
+	req = httptest.NewRequest(http.MethodGet, api.Prefix+"/activity", nil)
+	rec = httptest.NewRecorder()
+	s.Handler().ServeHTTP(rec, req)
+	var out struct {
+		Items []activity.Record `json:"items"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &out); err != nil {
+		t.Fatal(err)
+	}
+	if len(out.Items) != 1 {
+		t.Fatalf("ledger has %d rows, want 1: %s", len(out.Items), rec.Body)
+	}
+	if got := out.Items[0].Repository; got != "" {
+		t.Errorf("repository = %q; %q is not a stored Repository", got, got)
+	}
+}
+
+// The dashboard's filter bar and its rows come from two endpoints. They parse
+// the same query string, so they must answer about the same set of calls.
+func TestActivityStatsMatchTheFilteredRows(t *testing.T) {
+	s, _ := newServer(t)
+
+	for _, body := range []string{
+		`{"pattern":"no-such-token-xyz"}`,
+		`{"pattern":"another-missing-token"}`,
+	} {
+		req := httptest.NewRequest(http.MethodPost, api.Prefix+"/files/grep", strings.NewReader(body))
+		req.Header.Set("Content-Type", "application/json")
+		s.Handler().ServeHTTP(httptest.NewRecorder(), req)
+	}
+
+	get := func(path string, into any) {
+		t.Helper()
+		rec := httptest.NewRecorder()
+		s.Handler().ServeHTTP(rec, httptest.NewRequest(http.MethodGet, path, nil))
+		if rec.Code != http.StatusOK {
+			t.Fatalf("%s status %d: %s", path, rec.Code, rec.Body)
+		}
+		if err := json.Unmarshal(rec.Body.Bytes(), into); err != nil {
+			t.Fatalf("%s: %v", path, err)
+		}
+	}
+
+	var stats activity.Stats
+	get(api.Prefix+"/activity/stats?tool=grep", &stats)
+	var list struct {
+		Items []activity.Record `json:"items"`
+	}
+	get(api.Prefix+"/activity?tool=grep", &list)
+
+	if stats.Total != len(list.Items) {
+		t.Errorf("stats total = %d, rows = %d", stats.Total, len(list.Items))
+	}
+	if stats.Total != 2 {
+		t.Errorf("two greps ran, stats counted %d", stats.Total)
+	}
+
+	// The stats route must not be shadowed by /activity/{id}.
+	var narrowed activity.Stats
+	get(api.Prefix+"/activity/stats?outcome=nothing-has-this-outcome", &narrowed)
+	if narrowed.Total != 0 {
+		t.Errorf("an impossible filter counted %d", narrowed.Total)
 	}
 }

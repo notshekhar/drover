@@ -1,12 +1,14 @@
 package mcp
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"strings"
 
 	"gopkg.in/yaml.v3"
 
+	"github.com/notshekhar/drover/internal/activity"
 	"github.com/notshekhar/drover/internal/api"
 	"github.com/notshekhar/drover/internal/object"
 )
@@ -17,7 +19,8 @@ type callParams struct {
 	Arguments json.RawMessage `json:"arguments,omitempty"`
 }
 
-func (s *Server) callTool(params json.RawMessage) (any, *rpcError) {
+func (s *Server) callTool(ctx context.Context, params json.RawMessage) (any, *rpcError) {
+	ctx = activity.WithCaller(ctx, s.caller())
 	var req callParams
 	if err := json.Unmarshal(params, &req); err != nil {
 		return nil, errf(CodeInvalidParams, "invalid params: %v", err)
@@ -28,28 +31,28 @@ func (s *Server) callTool(params json.RawMessage) (any, *rpcError) {
 
 	switch req.Name {
 	case "ls":
-		return s.toolLs(req.Arguments), nil
+		return s.toolLs(ctx, req.Arguments), nil
 	case "read":
-		return s.toolRead(req.Arguments), nil
+		return s.toolRead(ctx, req.Arguments), nil
 	case "grep":
-		return s.toolGrep(req.Arguments), nil
+		return s.toolGrep(ctx, req.Arguments), nil
 	case "find":
-		return s.toolFind(req.Arguments), nil
+		return s.toolFind(ctx, req.Arguments), nil
 	case "git":
-		return s.toolGit(req.Arguments), nil
+		return s.toolGit(ctx, req.Arguments), nil
 	case "lsp":
-		return s.toolLSP(req.Arguments), nil
+		return s.toolLSP(ctx, req.Arguments), nil
 	}
 
 	switch req.Name {
 	case "api_list":
-		return s.toolAPIList(req.Arguments), nil
+		return s.toolAPIList(ctx, req.Arguments), nil
 	case "api_describe":
-		return s.toolAPIDescribe(req.Arguments), nil
+		return s.toolAPIDescribe(ctx, req.Arguments), nil
 	case "api_call":
-		return s.toolAPICall(req.Arguments), nil
+		return s.toolAPICall(ctx, req.Arguments), nil
 	case "sql_query":
-		return s.toolSQLQuery(req.Arguments), nil
+		return s.toolSQLQuery(ctx, req.Arguments), nil
 	}
 
 	// Unknown tool is a protocol-level error: the call could not be made at
@@ -66,12 +69,12 @@ func decodeArgs(raw json.RawMessage, v any) error {
 
 // --- file tools ---
 
-func (s *Server) toolLs(raw json.RawMessage) *CallResult {
+func (s *Server) toolLs(ctx context.Context, raw json.RawMessage) *CallResult {
 	var args api.LsRequest
 	if err := decodeArgs(raw, &args); err != nil {
 		return toolError("invalid arguments: %v", err)
 	}
-	res, err := s.Backend.Ls(args)
+	res, err := s.Backend.Ls(ctx, args)
 	if err != nil {
 		return toolError("%v", err)
 	}
@@ -104,7 +107,7 @@ func (s *Server) toolLs(raw json.RawMessage) *CallResult {
 	return text("%s", b.String())
 }
 
-func (s *Server) toolRead(raw json.RawMessage) *CallResult {
+func (s *Server) toolRead(ctx context.Context, raw json.RawMessage) *CallResult {
 	var args api.ReadRequest
 	if err := decodeArgs(raw, &args); err != nil {
 		return toolError("invalid arguments: %v", err)
@@ -112,7 +115,7 @@ func (s *Server) toolRead(raw json.RawMessage) *CallResult {
 	if strings.TrimSpace(args.Path) == "" {
 		return toolError("read needs a path, relative to the repository root, like api/internal/db.go")
 	}
-	res, err := s.Backend.ReadFile(args)
+	res, err := s.Backend.ReadFile(ctx, args)
 	if err != nil {
 		return toolError("%v", err)
 	}
@@ -132,7 +135,7 @@ func (s *Server) toolRead(raw json.RawMessage) *CallResult {
 	return text("%s", b.String())
 }
 
-func (s *Server) toolGrep(raw json.RawMessage) *CallResult {
+func (s *Server) toolGrep(ctx context.Context, raw json.RawMessage) *CallResult {
 	var args api.GrepRequest
 	if err := decodeArgs(raw, &args); err != nil {
 		return toolError("invalid arguments: %v", err)
@@ -140,7 +143,7 @@ func (s *Server) toolGrep(raw json.RawMessage) *CallResult {
 	if strings.TrimSpace(args.Pattern) == "" {
 		return toolError("grep needs a pattern")
 	}
-	res, err := s.Backend.Grep(args)
+	res, err := s.Backend.Grep(ctx, args)
 	if err != nil {
 		return toolError("%v", err)
 	}
@@ -159,7 +162,7 @@ func (s *Server) toolGrep(raw json.RawMessage) *CallResult {
 	return text("%s", b.String())
 }
 
-func (s *Server) toolFind(raw json.RawMessage) *CallResult {
+func (s *Server) toolFind(ctx context.Context, raw json.RawMessage) *CallResult {
 	var args api.FindRequest
 	if err := decodeArgs(raw, &args); err != nil {
 		return toolError("invalid arguments: %v", err)
@@ -167,7 +170,7 @@ func (s *Server) toolFind(raw json.RawMessage) *CallResult {
 	if strings.TrimSpace(args.Pattern) == "" {
 		return toolError("find needs a pattern")
 	}
-	res, err := s.Backend.Find(args)
+	res, err := s.Backend.Find(ctx, args)
 	if err != nil {
 		return toolError("%v", err)
 	}
@@ -192,7 +195,7 @@ func (s *Server) toolFind(raw json.RawMessage) *CallResult {
 
 // toolAPIList is the catalogue, with the fuzzy search that makes a large
 // collection usable.
-func (s *Server) toolAPIList(raw json.RawMessage) *CallResult {
+func (s *Server) toolAPIList(ctx context.Context, raw json.RawMessage) *CallResult {
 	var args struct {
 		Search string `json:"search"`
 	}
@@ -200,7 +203,7 @@ func (s *Server) toolAPIList(raw json.RawMessage) *CallResult {
 		return toolError("invalid arguments: %v", err)
 	}
 
-	items, err := s.Backend.List(object.KindHTTPRequest)
+	items, err := s.Backend.List(ctx, object.KindHTTPRequest)
 	if err != nil {
 		return toolError("%v", err)
 	}
@@ -234,7 +237,7 @@ func (s *Server) toolAPIList(raw json.RawMessage) *CallResult {
 
 	// The environments, because a caller choosing between stage and prod needs
 	// to know which exist and what each one points at.
-	if envs, err := s.Backend.List(object.KindEnvironment); err == nil && len(envs) > 0 {
+	if envs, err := s.Backend.List(ctx, object.KindEnvironment); err == nil && len(envs) > 0 {
 		fmt.Fprintf(&b, "%d environment(s):\n", len(envs))
 		for _, e := range envs {
 			b.WriteString(summarizeEnvironment(e))
@@ -320,7 +323,7 @@ func summarizeEnvironment(e api.ObjectView) string {
 }
 
 // toolAPIDescribe is the detail view: everything needed to fill a call in.
-func (s *Server) toolAPIDescribe(raw json.RawMessage) *CallResult {
+func (s *Server) toolAPIDescribe(ctx context.Context, raw json.RawMessage) *CallResult {
 	var args struct {
 		Request string `json:"request"`
 	}
@@ -331,7 +334,7 @@ func (s *Server) toolAPIDescribe(raw json.RawMessage) *CallResult {
 		return toolError("api_describe needs a request name; call api_list to see them")
 	}
 
-	v, err := s.Backend.Get(object.KindHTTPRequest, args.Request)
+	v, err := s.Backend.Get(ctx, object.KindHTTPRequest, args.Request)
 	if err != nil {
 		return toolError("%v (call api_list to see the configured requests)", err)
 	}
@@ -411,7 +414,7 @@ func describeParam(p object.Param, required bool) string {
 }
 
 // toolAPICall performs one request.
-func (s *Server) toolAPICall(raw json.RawMessage) *CallResult {
+func (s *Server) toolAPICall(ctx context.Context, raw json.RawMessage) *CallResult {
 	var args struct {
 		Request     string         `json:"request"`
 		Params      map[string]any `json:"params"`
@@ -432,7 +435,7 @@ func (s *Server) toolAPICall(raw json.RawMessage) *CallResult {
 		params[k] = stringify(v)
 	}
 
-	resp, err := s.Backend.Call(args.Request, api.CallRequest{
+	resp, err := s.Backend.Call(ctx, args.Request, api.CallRequest{
 		Environment: args.Environment,
 		Params:      params,
 	})
@@ -460,7 +463,7 @@ func (s *Server) toolAPICall(raw json.RawMessage) *CallResult {
 }
 
 // toolSQLQuery runs one statement against a named connection.
-func (s *Server) toolSQLQuery(raw json.RawMessage) *CallResult {
+func (s *Server) toolSQLQuery(ctx context.Context, raw json.RawMessage) *CallResult {
 	var args struct {
 		Connection string `json:"connection"`
 		Query      string `json:"query"`
@@ -475,7 +478,7 @@ func (s *Server) toolSQLQuery(raw json.RawMessage) *CallResult {
 		return toolError("sql_query needs a SQL statement")
 	}
 
-	res, err := s.Backend.Query(args.Connection, args.Query)
+	res, err := s.Backend.Query(ctx, args.Connection, args.Query)
 	if err != nil {
 		return toolError("%v", err)
 	}

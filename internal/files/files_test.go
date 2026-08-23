@@ -1,6 +1,7 @@
 package files
 
 import (
+	"context"
 	"errors"
 	"os"
 	"path/filepath"
@@ -159,7 +160,7 @@ func TestReadMissingFile(t *testing.T) {
 
 func TestGrep(t *testing.T) {
 	r := tree(t)
-	res, err := r.Grep("TODO", GrepOptions{})
+	res, err := r.Grep(context.Background(), "TODO", GrepOptions{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -177,7 +178,7 @@ func TestGrep(t *testing.T) {
 
 func TestGrepIsCaseInsensitiveByDefault(t *testing.T) {
 	r := tree(t)
-	res, err := r.Grep("todo", GrepOptions{})
+	res, err := r.Grep(context.Background(), "todo", GrepOptions{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -185,7 +186,7 @@ func TestGrepIsCaseInsensitiveByDefault(t *testing.T) {
 		t.Errorf("case-insensitive search found %d matches, want 1", len(res.Matches))
 	}
 
-	res, err = r.Grep("todo", GrepOptions{CaseSensitive: true})
+	res, err = r.Grep(context.Background(), "todo", GrepOptions{CaseSensitive: true})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -197,7 +198,7 @@ func TestGrepIsCaseInsensitiveByDefault(t *testing.T) {
 func TestGrepScopeAndInclude(t *testing.T) {
 	r := tree(t)
 
-	res, err := r.Grep("package", GrepOptions{Path: "api"})
+	res, err := r.Grep(context.Background(), "package", GrepOptions{Path: "api"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -207,7 +208,7 @@ func TestGrepScopeAndInclude(t *testing.T) {
 		}
 	}
 
-	res, err = r.Grep("o", GrepOptions{Include: "*.js"})
+	res, err = r.Grep(context.Background(), "o", GrepOptions{Include: "*.js"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -220,7 +221,7 @@ func TestGrepScopeAndInclude(t *testing.T) {
 
 func TestGrepSkipsBinaryAndGit(t *testing.T) {
 	r := tree(t)
-	res, err := r.Grep("PNG|core", GrepOptions{})
+	res, err := r.Grep(context.Background(), "PNG|core", GrepOptions{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -236,14 +237,14 @@ func TestGrepSkipsBinaryAndGit(t *testing.T) {
 
 func TestGrepBadPattern(t *testing.T) {
 	r := tree(t)
-	if _, err := r.Grep("([", GrepOptions{}); err == nil {
+	if _, err := r.Grep(context.Background(), "([", GrepOptions{}); err == nil {
 		t.Fatal("an invalid regular expression was accepted")
 	}
 }
 
 func TestGrepTruncates(t *testing.T) {
 	r := tree(t)
-	res, err := r.Grep(".", GrepOptions{MaxResults: 2})
+	res, err := r.Grep(context.Background(), ".", GrepOptions{MaxResults: 2})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -254,7 +255,7 @@ func TestGrepTruncates(t *testing.T) {
 
 func TestFindByName(t *testing.T) {
 	r := tree(t)
-	res, err := r.Find("*.go", "", 0)
+	res, err := r.Find(context.Background(), "*.go", "", 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -273,7 +274,7 @@ func TestFindByName(t *testing.T) {
 // do what they look like.
 func TestFindByPath(t *testing.T) {
 	r := tree(t)
-	res, err := r.Find("api/internal/*.go", "", 0)
+	res, err := r.Find(context.Background(), "api/internal/*.go", "", 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -284,7 +285,7 @@ func TestFindByPath(t *testing.T) {
 
 func TestFindSkipsGit(t *testing.T) {
 	r := tree(t)
-	res, err := r.Find("config", "", 0)
+	res, err := r.Find(context.Background(), "config", "", 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -312,10 +313,10 @@ func TestPathTraversalIsRefused(t *testing.T) {
 		if _, err := r.Read(bad, 0, 0); err == nil {
 			t.Errorf("Read(%q) was allowed", bad)
 		}
-		if _, err := r.Grep("x", GrepOptions{Path: bad}); err == nil {
+		if _, err := r.Grep(context.Background(), "x", GrepOptions{Path: bad}); err == nil {
 			t.Errorf("Grep(path=%q) was allowed", bad)
 		}
-		if _, err := r.Find("*", bad, 0); err == nil {
+		if _, err := r.Find(context.Background(), "*", bad, 0); err == nil {
 			t.Errorf("Find(path=%q) was allowed", bad)
 		}
 	}
@@ -359,7 +360,7 @@ func TestGrepDoesNotFollowSymlinksOut(t *testing.T) {
 		t.Skipf("symlinks unavailable: %v", err)
 	}
 
-	res, err := r.Grep("NEEDLE", GrepOptions{})
+	res, err := r.Grep(context.Background(), "NEEDLE", GrepOptions{})
 	if err != nil {
 		t.Fatal(err)
 	}

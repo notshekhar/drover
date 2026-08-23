@@ -1,6 +1,7 @@
 package mcp
 
 import (
+	"context"
 	"crypto/sha256"
 	"encoding/json"
 	"time"
@@ -39,7 +40,10 @@ var toolChangePoll = 5 * time.Second
 // applied between the caller's decision to watch and the scheduler getting
 // here would be folded into the baseline and could then never look like a
 // change. See startToolWatch, which takes it synchronously.
-func (s *Server) watchToolChanges(notify func(method string, params any), baseline string, done <-chan struct{}) {
+// onTick, when set, runs before each poll and ends the watch if it returns
+// true. The HTTP hub uses it to retire a watcher nobody is listening to
+// any more; the stdio bridge has exactly one peer and passes nil.
+func (s *Server) watchToolChanges(ctx context.Context, notify func(method string, params any), baseline string, done <-chan struct{}, onTick func() bool) {
 	last := baseline
 
 	ticker := time.NewTicker(toolChangePoll)
@@ -47,10 +51,15 @@ func (s *Server) watchToolChanges(notify func(method string, params any), baseli
 
 	for {
 		select {
+		case <-ctx.Done():
+			return
 		case <-done:
 			return
 		case <-ticker.C:
-			current, ok := s.toolFingerprint()
+			if onTick != nil && onTick() {
+				return
+			}
+			current, ok := s.toolFingerprint(ctx)
 			if !ok {
 				// A momentary failure to reach the engine collapses the list
 				// to the file tools. Announcing that would tell the client to
@@ -77,15 +86,15 @@ func (s *Server) watchToolChanges(notify func(method string, params any), baseli
 // -- the databases inside sql_query's description, the counts inside
 // api_list's -- so a connection appearing changes the payload the client
 // caches even though the tool set is the same size.
-func (s *Server) toolFingerprint() (string, bool) {
+func (s *Server) toolFingerprint(ctx context.Context) (string, bool) {
 	// The tool builders swallow their errors and return no tools, which is
 	// right for serving a list but would make an unreachable engine look like
 	// an empty one here. Ask a question whose failure is visible first.
-	if _, err := s.Backend.List(object.KindRepository); err != nil {
+	if _, err := s.Backend.List(ctx, object.KindRepository); err != nil {
 		return "", false
 	}
 
-	result, rpcErr := s.listTools(nil)
+	result, rpcErr := s.listTools(ctx, nil)
 	if rpcErr != nil {
 		return "", false
 	}

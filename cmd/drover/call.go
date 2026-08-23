@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"flag"
 	"fmt"
@@ -32,7 +33,7 @@ func (p paramFlag) Set(v string) error {
 	return nil
 }
 
-func cmdCall(args []string) error {
+func cmdCall(ctx context.Context, args []string) error {
 	fs := flag.NewFlagSet("call", flag.ContinueOnError)
 	fs.SetOutput(os.Stderr)
 	params := paramFlag{}
@@ -58,7 +59,7 @@ func cmdCall(args []string) error {
 		return err
 	}
 
-	resp, err := c.Call(rest[0], api.CallRequest{
+	resp, err := c.Call(ctx, rest[0], api.CallRequest{
 		Environment:       *envFlag,
 		Params:            params,
 		AllowUnsafeMethod: *unsafeFlag,
@@ -95,7 +96,7 @@ func cmdCall(args []string) error {
 	}
 }
 
-func cmdQuery(args []string) error {
+func cmdQuery(ctx context.Context, args []string) error {
 	fs := flag.NewFlagSet("query", flag.ContinueOnError)
 	fs.SetOutput(os.Stderr)
 	var (
@@ -118,7 +119,7 @@ func cmdQuery(args []string) error {
 	if err != nil {
 		return err
 	}
-	res, err := c.Query(rest[0], strings.Join(rest[1:], " "))
+	res, err := c.Query(ctx, rest[0], strings.Join(rest[1:], " "))
 	if err != nil {
 		return err
 	}
@@ -152,7 +153,7 @@ func cmdQuery(args []string) error {
 	return nil
 }
 
-func cmdHealth(args []string) error {
+func cmdHealth(ctx context.Context, args []string) error {
 	fs := flag.NewFlagSet("health", flag.ContinueOnError)
 	fs.SetOutput(os.Stderr)
 	var (
@@ -172,7 +173,7 @@ func cmdHealth(args []string) error {
 	if err != nil {
 		return err
 	}
-	if err := c.Health(rest[0]); err != nil {
+	if err := c.Health(ctx, rest[0]); err != nil {
 		return err
 	}
 	fmt.Printf("%s is healthy; a sql tool will be offered for it\n", rest[0])

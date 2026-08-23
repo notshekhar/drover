@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"flag"
 	"fmt"
 	"os"
@@ -8,7 +9,7 @@ import (
 	"github.com/notshekhar/drover/internal/mcp"
 )
 
-func cmdMCP(args []string) error {
+func cmdMCP(ctx context.Context, args []string) error {
 	fs := flag.NewFlagSet("mcp", flag.ContinueOnError)
 	fs.SetOutput(os.Stderr)
 	var (
@@ -29,7 +30,7 @@ func cmdMCP(args []string) error {
 	// Fail here rather than at the first tool call. An agent that spawns this
 	// and gets a working stdio session, only for every tool to error, is much
 	// harder to diagnose than one that never starts.
-	if _, err := c.Status(); err != nil {
+	if _, err := c.Status(ctx); err != nil {
 		return fmt.Errorf("%w\nstart it with `drover serve`", err)
 	}
 
@@ -38,5 +39,5 @@ func cmdMCP(args []string) error {
 	fmt.Fprintf(os.Stderr, "drover mcp: bridging %s\n", c.BaseURL)
 
 	srv := &mcp.Server{Backend: c, Version: Version}
-	return srv.Serve(os.Stdin, os.Stdout)
+	return srv.Serve(ctx, os.Stdin, os.Stdout)
 }

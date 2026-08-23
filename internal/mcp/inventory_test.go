@@ -166,17 +166,19 @@ spec:
 	}
 }
 
-// listChanged is a promise to push a message. Only stdio can keep it: the HTTP
-// endpoint answers GET with 405, so a client there has nowhere to receive one
-// and would wait forever for a notification that cannot be sent.
-func TestListChangedIsPromisedOnlyWhereItCanBeKept(t *testing.T) {
+// listChanged is a promise to push a message, and both transports can now keep
+// it: stdio writes down its own pipe, HTTP down the GET event stream. It used
+// to be stdio only, because GET was answered with 405 -- an HTTP client was
+// left re-listing whenever it happened to reconnect.
+func TestListChangedIsPromisedOnBothTransports(t *testing.T) {
 	s := start(t, t.TempDir())
 	if !toolsCapability(t, initCapabilities(t, s))["listChanged"].(bool) {
 		t.Error("stdio did not advertise listChanged, which it can deliver")
 	}
 
-	if _, ok := toolsCapability(t, httpInitCapabilities(t, t.TempDir()))["listChanged"]; ok {
-		t.Error("the HTTP transport promised listChanged, which it cannot deliver")
+	promised, ok := toolsCapability(t, httpInitCapabilities(t, t.TempDir()))["listChanged"].(bool)
+	if !ok || !promised {
+		t.Error("the HTTP transport did not advertise listChanged, which it can now deliver")
 	}
 }
 

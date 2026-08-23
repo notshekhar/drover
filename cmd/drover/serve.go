@@ -13,6 +13,7 @@ import (
 	"github.com/notshekhar/drover/internal/config"
 	"github.com/notshekhar/drover/internal/server"
 	"github.com/notshekhar/drover/internal/tui"
+	"github.com/notshekhar/drover/internal/web"
 )
 
 // shutdownGrace is how long in-flight requests get to finish.
@@ -23,7 +24,7 @@ import (
 // immediate.
 const shutdownGrace = 10 * time.Second
 
-func cmdServe(args []string) error {
+func cmdServe(ctx context.Context, args []string) error {
 	fs := flag.NewFlagSet("serve", flag.ContinueOnError)
 	fs.SetOutput(os.Stderr)
 	var (
@@ -92,7 +93,10 @@ func cmdServe(args []string) error {
 		return err
 	}
 
-	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	// Derived from the process context rather than starting a fresh one, so
+	// there is a single interrupt path: main installs the handler, serve adds
+	// SIGTERM handling for the same tree.
+	ctx, stop := signal.NotifyContext(ctx, os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
 	// Workers come up after bootstrap and before serving. Reconciles run in
@@ -147,6 +151,7 @@ func cmdServe(args []string) error {
 		fmt.Fprintf(os.Stderr, "drover %s listening on http://%s (data %s, sync %s)\n",
 			Version, ln.Addr(), dataDir, cfg.SyncInterval())
 		fmt.Fprintf(os.Stderr, "  MCP: http://%s%s\n", ln.Addr(), server.MCPPath)
+		fmt.Fprintf(os.Stderr, "  dash: http://%s%s\n", ln.Addr(), web.Path)
 		fmt.Fprintf(os.Stderr, "  add it with: claude mcp add --transport http drover http://%s%s\n",
 			ln.Addr(), server.MCPPath)
 		select {

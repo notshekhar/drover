@@ -1,6 +1,7 @@
 package mcp
 
 import (
+	"context"
 	"fmt"
 	"sort"
 	"strings"
@@ -39,7 +40,7 @@ const (
 // over HTTP and may well be started before `drover serve`; an initialize that
 // failed because the inventory could not be fetched would be a far worse
 // outcome than one with a vague preamble.
-func (s *Server) inventory() string {
+func (s *Server) inventory(ctx context.Context) string {
 	s.invMu.Lock()
 	defer s.invMu.Unlock()
 
@@ -47,7 +48,7 @@ func (s *Server) inventory() string {
 		return s.invCache
 	}
 
-	rendered := s.renderInventory()
+	rendered := s.renderInventory(ctx)
 	// Only a successful render refreshes the clock. An engine that was down
 	// returns "" without pinning that emptiness for the next ten seconds.
 	if rendered != "" {
@@ -57,19 +58,19 @@ func (s *Server) inventory() string {
 	return rendered
 }
 
-func (s *Server) renderInventory() string {
+func (s *Server) renderInventory(ctx context.Context) string {
 	var sections []string
 
-	if sec := s.repositorySection(); sec != "" {
+	if sec := s.repositorySection(ctx); sec != "" {
 		sections = append(sections, sec)
 	}
-	if sec := s.environmentSection(); sec != "" {
+	if sec := s.environmentSection(ctx); sec != "" {
 		sections = append(sections, sec)
 	}
-	if sec := s.requestSection(); sec != "" {
+	if sec := s.requestSection(ctx); sec != "" {
 		sections = append(sections, sec)
 	}
-	if sec := s.databaseSection(); sec != "" {
+	if sec := s.databaseSection(ctx); sec != "" {
 		sections = append(sections, sec)
 	}
 
@@ -79,8 +80,8 @@ func (s *Server) renderInventory() string {
 	return "This engine currently holds:\n\n" + strings.Join(sections, "\n")
 }
 
-func (s *Server) repositorySection() string {
-	items, err := s.Backend.List(object.KindRepository)
+func (s *Server) repositorySection(ctx context.Context) string {
+	items, err := s.Backend.List(ctx, object.KindRepository)
 	if err != nil || len(items) == 0 {
 		return ""
 	}
@@ -139,8 +140,8 @@ func repositoryDetail(v api.ObjectView) string {
 	return strings.Join(parts, "  ")
 }
 
-func (s *Server) environmentSection() string {
-	items, err := s.Backend.List(object.KindEnvironment)
+func (s *Server) environmentSection(ctx context.Context) string {
+	items, err := s.Backend.List(ctx, object.KindEnvironment)
 	if err != nil || len(items) == 0 {
 		return ""
 	}
@@ -161,8 +162,8 @@ func (s *Server) environmentSection() string {
 	return fmt.Sprintf("ENVIRONMENTS (%d)\n  %s%s\n", len(items), strings.Join(names, ", "), suffix)
 }
 
-func (s *Server) requestSection() string {
-	items, err := s.Backend.List(object.KindHTTPRequest)
+func (s *Server) requestSection(ctx context.Context) string {
+	items, err := s.Backend.List(ctx, object.KindHTTPRequest)
 	if err != nil || len(items) == 0 {
 		return ""
 	}
@@ -186,8 +187,8 @@ func (s *Server) requestSection() string {
 	}
 }
 
-func (s *Server) databaseSection() string {
-	items, err := s.Backend.List(object.KindSQLConnection)
+func (s *Server) databaseSection(ctx context.Context) string {
+	items, err := s.Backend.List(ctx, object.KindSQLConnection)
 	if err != nil || len(items) == 0 {
 		return ""
 	}

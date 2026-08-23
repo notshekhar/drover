@@ -26,6 +26,7 @@ func RenderSummary(m Model, width int) string {
 
 	fmt.Fprintf(&b, "  %sengine%s  http://%s\n", dim, reset, m.Listen)
 	fmt.Fprintf(&b, "  %sMCP%s     http://%s/mcp\n", dim, reset, m.Listen)
+	fmt.Fprintf(&b, "  %sdash%s    http://%s/dashboard\n", dim, reset, m.Listen)
 	fmt.Fprintf(&b, "  %sdata%s    %s\n", dim, reset, truncate(homeShort(m.DataDir), width-12))
 	fmt.Fprintf(&b, "  %suptime%s  %s\n\n", dim, reset, humanDuration(time.Since(m.Started)))
 

@@ -11,6 +11,7 @@ package files
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"errors"
 	"fmt"
 	"io"
@@ -485,7 +486,7 @@ type GrepOptions struct {
 // costs a full walk, but it is what makes the answer stable: the same query
 // against the same checkout returns the same 200 lines, instead of whichever
 // 200 the directory order happened to reach first.
-func (r *Root) Grep(pattern string, opts GrepOptions) (*GrepResult, error) {
+func (r *Root) Grep(ctx context.Context, pattern string, opts GrepOptions) (*GrepResult, error) {
 	if strings.TrimSpace(pattern) == "" {
 		return nil, errors.New("the pattern is empty")
 	}
@@ -516,7 +517,7 @@ func (r *Root) Grep(pattern string, opts GrepOptions) (*GrepResult, error) {
 	// that is what gets spread across cores.
 	var paths []string
 	var globErr error
-	err = r.walk(base, func(abs string, d os.DirEntry) error {
+	err = r.walk(ctx, base, func(abs string, d os.DirEntry) error {
 		if opts.Include != "" {
 			ok, err := filepath.Match(opts.Include, d.Name())
 			if err != nil {
@@ -537,7 +538,7 @@ func (r *Root) Grep(pattern string, opts GrepOptions) (*GrepResult, error) {
 		return nil, err
 	}
 
-	matches := r.grepAll(paths, re, probe)
+	matches := r.grepAll(ctx, paths, re, probe)
 	sort.Slice(matches, func(i, j int) bool {
 		if matches[i].Path != matches[j].Path {
 			return matches[i].Path < matches[j].Path
@@ -580,7 +581,7 @@ func wholeFileProbe(expr, raw string) (*regexp.Regexp, error) {
 }
 
 // grepAll searches every path, one worker per core.
-func (r *Root) grepAll(paths []string, re, probe *regexp.Regexp) []Match {
+func (r *Root) grepAll(ctx context.Context, paths []string, re, probe *regexp.Regexp) []Match {
 	workers := runtime.NumCPU()
 	if workers > len(paths) {
 		workers = len(paths)
@@ -605,7 +606,14 @@ func (r *Root) grepAll(paths []string, re, probe *regexp.Regexp) []Match {
 		}(i)
 	}
 	for _, p := range paths {
-		next <- p
+		select {
+		case next <- p:
+		case <-ctx.Done():
+			// Stop feeding; the workers drain what is queued and exit.
+			close(next)
+			wg.Wait()
+			return nil
+		}
 	}
 	close(next)
 	wg.Wait()
@@ -738,7 +746,7 @@ type FindResult struct {
 // Find matches paths by glob. A pattern with no slash matches the file name;
 // one with a slash matches the whole repo-relative path, so both `*.go` and
 // `api/internal/*.go` do what they look like.
-func (r *Root) Find(pattern, path string, maxResults int) (*FindResult, error) {
+func (r *Root) Find(ctx context.Context, pattern, path string, maxResults int) (*FindResult, error) {
 	if strings.TrimSpace(pattern) == "" {
 		return nil, errors.New("the pattern is empty")
 	}
@@ -757,7 +765,7 @@ func (r *Root) Find(pattern, path string, maxResults int) (*FindResult, error) {
 	matchWholePath := strings.Contains(pattern, "/")
 
 	out := &FindResult{Paths: []string{}}
-	err = r.walk(base, func(abs string, d os.DirEntry) error {
+	err = r.walk(ctx, base, func(abs string, d os.DirEntry) error {
 		subject := d.Name()
 		if matchWholePath {
 			subject = r.display(abs)
@@ -792,8 +800,16 @@ var errStop = errors.New("enough")
 // base is exempt from the skip list. Someone who points a search at
 // node_modules meant it; the list is only about what a walk wanders into on
 // its way somewhere else.
-func (r *Root) walk(base string, fn func(abs string, d os.DirEntry) error) error {
+//
+// The context is checked per entry rather than per directory: a search across
+// every checkout is one long CPU burn with no natural pause in it, and a
+// caller that has hung up should stop paying for it within one stat, not at
+// the next directory boundary.
+func (r *Root) walk(ctx context.Context, base string, fn func(abs string, d os.DirEntry) error) error {
 	return filepath.WalkDir(base, func(abs string, d os.DirEntry, err error) error {
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
 		if err != nil {
 			// An unreadable directory should not abort the whole search.
 			if d != nil && d.IsDir() {

@@ -20,6 +20,7 @@ import (
 // state is cached and refreshed in the background rather than blocking the
 // paint on a round trip.
 type remoteSource struct {
+	ctx     context.Context
 	c       *client.Client
 	started time.Time
 
@@ -28,7 +29,7 @@ type remoteSource struct {
 }
 
 func (r *remoteSource) refresh() {
-	state, err := r.c.Dashboard()
+	state, err := r.c.Dashboard(r.ctx)
 	if err != nil {
 		r.errMsg = err.Error()
 		return
@@ -49,10 +50,10 @@ func (r *remoteSource) Snapshot() tui.Model {
 	return m
 }
 
-func (r *remoteSource) Reload() (string, error) { return r.c.Reload() }
-func (r *remoteSource) SyncAll() error          { return r.c.SyncAll() }
+func (r *remoteSource) Reload() (string, error) { return r.c.Reload(r.ctx) }
+func (r *remoteSource) SyncAll() error          { return r.c.SyncAll(r.ctx) }
 
-func cmdDash(args []string) error {
+func cmdDash(ctx context.Context, args []string) error {
 	fs := flag.NewFlagSet("dash", flag.ContinueOnError)
 	fs.SetOutput(os.Stderr)
 	var (
@@ -70,7 +71,7 @@ func cmdDash(args []string) error {
 		return err
 	}
 	// Fail here rather than painting an empty screen that never fills in.
-	if _, err := c.Status(); err != nil {
+	if _, err := c.Status(ctx); err != nil {
 		return fmt.Errorf("%w\nstart it with `drover serve`", err)
 	}
 
@@ -81,7 +82,7 @@ func cmdDash(args []string) error {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	src := &remoteSource{c: c, started: time.Now()}
+	src := &remoteSource{ctx: ctx, c: c, started: time.Now()}
 	runner := &tui.Runner{
 		Source: src,
 		// dash opens on the detail view; that is the point of opening it.

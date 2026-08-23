@@ -1,6 +1,7 @@
 package mcp
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"sort"
@@ -18,10 +19,10 @@ import (
 // place to put a catalogue, because every entry is re-sent on every
 // tools/list and competes for attention with the eight that were already
 // there. The operations belong in an enum.
-func (s *Server) gitTools() []Tool {
+func (s *Server) gitTools(ctx context.Context) []Tool {
 	return []Tool{{
 		Name:        "git",
-		Description: gitDescription + s.repositoryCatalog(),
+		Description: gitDescription + s.repositoryCatalog(ctx),
 		InputSchema: Schema{
 			Type:       "object",
 			Additional: boolPtr(false),
@@ -75,8 +76,8 @@ const gitDescription = "Read the git history of the repositories drover holds. "
 // disk, so a repository whose clone failed is named along with its error --
 // otherwise it is simply missing from the list, and a model that was told it
 // exists keeps asking for it.
-func (s *Server) repositoryCatalog() string {
-	items, err := s.Backend.List(object.KindRepository)
+func (s *Server) repositoryCatalog(ctx context.Context) string {
+	items, err := s.Backend.List(ctx, object.KindRepository)
 	if err != nil || len(items) == 0 {
 		return "No repositories have been applied yet, so there is no history to read."
 	}
@@ -103,7 +104,7 @@ func (s *Server) repositoryCatalog() string {
 
 // --- the call ---
 
-func (s *Server) toolGit(raw json.RawMessage) *CallResult {
+func (s *Server) toolGit(ctx context.Context, raw json.RawMessage) *CallResult {
 	var args api.GitRequest
 	if err := decodeArgs(raw, &args); err != nil {
 		return toolError("invalid arguments: %v", err)
@@ -111,7 +112,7 @@ func (s *Server) toolGit(raw json.RawMessage) *CallResult {
 	if strings.TrimSpace(args.Operation) == "" {
 		return toolError("git needs an operation: one of %s", strings.Join(git.Operations, ", "))
 	}
-	res, err := s.Backend.Git(args)
+	res, err := s.Backend.Git(ctx, args)
 	if err != nil {
 		return toolError("%v", err)
 	}

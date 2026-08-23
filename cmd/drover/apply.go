@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"flag"
 	"fmt"
 	"io"
@@ -18,7 +19,7 @@ type repeatable []string
 func (r *repeatable) String() string     { return fmt.Sprint(*r) }
 func (r *repeatable) Set(v string) error { *r = append(*r, v); return nil }
 
-func cmdApply(args []string) error {
+func cmdApply(ctx context.Context, args []string) error {
 	fs := flag.NewFlagSet("apply", flag.ContinueOnError)
 	fs.SetOutput(os.Stderr)
 	var paths repeatable
@@ -65,7 +66,7 @@ func cmdApply(args []string) error {
 	if err != nil {
 		return err
 	}
-	resp, err := client.New(url).Apply(docs)
+	resp, err := client.New(url).Apply(ctx, docs)
 	if err != nil {
 		return err
 	}

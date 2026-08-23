@@ -188,6 +188,7 @@ func TestSummaryIsCountsNotTables(t *testing.T) {
 	for _, want := range []string{
 		"drover 1.2.3",
 		"127.0.0.1:7432/mcp",
+		"127.0.0.1:7432/dashboard",
 		"repositories", "http requests", "databases", "environments",
 		"d details", "s sync", "q quit",
 	} {
@@ -221,6 +222,19 @@ func TestSummaryShowsWhatIsOffered(t *testing.T) {
 	out := stripANSI(RenderSummary(sample(), 78))
 	if !strings.Contains(out, "1 offered") {
 		t.Errorf("the summary does not distinguish stored from offered:\n%s", out)
+	}
+}
+
+// The browser URL belongs on the start screen, where it can be copied. The
+// details view already has the tables; putting it there a second time is noise.
+func TestSummaryShowsDashURLNotDetails(t *testing.T) {
+	sum := stripANSI(RenderSummary(sample(), 78))
+	if !strings.Contains(sum, "127.0.0.1:7432/dashboard") {
+		t.Errorf("the summary is missing the dash URL:\n%s", sum)
+	}
+	detail := stripANSI(Render(sample(), 100))
+	if strings.Contains(detail, "/dashboard") {
+		t.Errorf("the details view should not repeat the dash URL:\n%s", detail)
 	}
 }
 

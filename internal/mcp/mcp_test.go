@@ -2,6 +2,7 @@ package mcp_test
 
 import (
 	"bufio"
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -39,13 +40,14 @@ func start(t *testing.T, dataDir string) *session {
 	}
 	httpSrv := httptest.NewServer(eng.Handler())
 	t.Cleanup(httpSrv.Close)
+	t.Cleanup(func() { _ = eng.Shutdown(context.Background()) })
 
 	clientIn, serverIn := io.Pipe()
 	serverOut, clientOut := io.Pipe()
 
 	s := &mcp.Server{Backend: client.New(httpSrv.URL), Version: "test"}
 	done := make(chan error, 1)
-	go func() { done <- s.Serve(clientIn, clientOut) }()
+	go func() { done <- s.Serve(context.Background(), clientIn, clientOut) }()
 
 	sess := &session{t: t, in: serverIn, out: bufio.NewReaderSize(serverOut, 1<<20), done: done}
 	t.Cleanup(func() { serverIn.Close() })
@@ -64,7 +66,7 @@ func startDetached(t *testing.T) *session {
 	// engine fails rather than hanging.
 	s := &mcp.Server{Backend: client.New("http://127.0.0.1:1"), Version: "test"}
 	done := make(chan error, 1)
-	go func() { done <- s.Serve(clientIn, clientOut) }()
+	go func() { done <- s.Serve(context.Background(), clientIn, clientOut) }()
 
 	sess := &session{t: t, in: serverIn, out: bufio.NewReaderSize(serverOut, 1<<20), done: done}
 	t.Cleanup(func() { serverIn.Close() })
@@ -181,8 +183,10 @@ func applyDoc(t *testing.T, dataDir, doc string) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	defer func() { _ = eng.Shutdown(context.Background()) }()
 	body, _ := json.Marshal(api.ApplyRequest{Documents: []api.Document{{Source: "/work/test.yaml", Data: doc}}})
 	req := httptest.NewRequest(http.MethodPost, api.Prefix+"/apply", strings.NewReader(string(body)))
+	req.Header.Set("Content-Type", "application/json")
 	rec := httptest.NewRecorder()
 	eng.Handler().ServeHTTP(rec, req)
 	if rec.Code != http.StatusOK {

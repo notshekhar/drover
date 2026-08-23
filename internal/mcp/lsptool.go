@@ -1,6 +1,7 @@
 package mcp
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"strings"
@@ -17,10 +18,10 @@ import (
 // literally nothing for them to act on; lsp acts on the same checkouts grep
 // does, so if there is anything to grep there is something to navigate. And
 // nothing is launched until a question is asked, so offering it costs nothing.
-func (s *Server) lspTools() []Tool {
+func (s *Server) lspTools(ctx context.Context) []Tool {
 	return []Tool{{
 		Name:        "lsp",
-		Description: fmt.Sprintf(lspDescription, s.lspLanguages()),
+		Description: fmt.Sprintf(lspDescription, s.lspLanguages(ctx)),
 		InputSchema: Schema{
 			Type:       "object",
 			Additional: boolPtr(false),
@@ -74,7 +75,7 @@ const languageCacheTTL = 30 * time.Second
 
 // lspLanguages names what is usable, so the description does not promise Java
 // on a machine with no JVM.
-func (s *Server) lspLanguages() string {
+func (s *Server) lspLanguages(ctx context.Context) string {
 	s.langMu.Lock()
 	if time.Since(s.langAt) < languageCacheTTL && s.langCache != "" {
 		defer s.langMu.Unlock()
@@ -82,20 +83,28 @@ func (s *Server) lspLanguages() string {
 	}
 	s.langMu.Unlock()
 
-	langs := s.probeLanguages()
+	langs, probed := s.probeLanguages(ctx)
 
-	s.langMu.Lock()
-	s.langCache, s.langAt = langs, time.Now()
-	s.langMu.Unlock()
+	// Only a real probe refreshes the clock. A caller that hung up mid-list
+	// gets the unprobed fallback, which is the right answer for them and the
+	// wrong one to pin for the next thirty seconds -- the client after them
+	// would be told Java works on a machine with no JVM. Same rule the
+	// inventory cache uses for an engine that was down.
+	if probed {
+		s.langMu.Lock()
+		s.langCache, s.langAt = langs, time.Now()
+		s.langMu.Unlock()
+	}
 	return langs
 }
 
-func (s *Server) probeLanguages() string {
-	res, err := s.Backend.LSP(api.LSPRequest{Operation: "servers"})
+// probeLanguages reports what it found and whether it got to ask at all.
+func (s *Server) probeLanguages(ctx context.Context) (string, bool) {
+	res, err := s.Backend.LSP(ctx, api.LSPRequest{Operation: "servers"})
 	if err != nil {
 		// The tool is still offered: its servers operation is exactly how you
 		// find out why this failed.
-		return strings.Join(lsp.Languages(), ", ")
+		return strings.Join(lsp.Languages(), ", "), false
 	}
 	var ready, missing []string
 	for _, server := range res.Servers {
@@ -107,18 +116,18 @@ func (s *Server) probeLanguages() string {
 		}
 	}
 	if len(ready) == 0 {
-		return strings.Join(missing, ", ") + " -- none can start on this machine; ask the servers operation why"
+		return strings.Join(missing, ", ") + " -- none can start on this machine; ask the servers operation why", true
 	}
 	out := strings.Join(ready, ", ")
 	if len(missing) > 0 {
 		out += " (" + strings.Join(missing, " and ") + " cannot start here -- ask the servers operation why)"
 	}
-	return out
+	return out, true
 }
 
 // --- the call ---
 
-func (s *Server) toolLSP(raw json.RawMessage) *CallResult {
+func (s *Server) toolLSP(ctx context.Context, raw json.RawMessage) *CallResult {
 	var args api.LSPRequest
 	if err := decodeArgs(raw, &args); err != nil {
 		return toolError("invalid arguments: %v", err)
@@ -126,7 +135,7 @@ func (s *Server) toolLSP(raw json.RawMessage) *CallResult {
 	if strings.TrimSpace(args.Operation) == "" {
 		return toolError("lsp needs an operation: one of %s", strings.Join(lsp.Operations, ", "))
 	}
-	res, err := s.Backend.LSP(args)
+	res, err := s.Backend.LSP(ctx, args)
 	if err != nil {
 		return toolError("%v", err)
 	}

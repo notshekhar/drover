@@ -365,6 +365,7 @@ file, no tool that POSTs, and no tool that writes to a database.
 ```
 ~/.drover/
   config.yaml               servers, listen address, apply provenance
+  activity.db               the activity ledger — every tool call, on this machine
   objects/<Kind>/<name>.yaml the applied documents — the source of truth
   status/                    observed state, kept apart from desired state
   repos/<name>/              the checkouts
@@ -418,6 +419,19 @@ No cgo, so every target cross-compiles from anywhere:
 ```bash
 CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go build ./cmd/drover
 ```
+
+The browser dashboard is a Vite build committed under `internal/web/dist` and
+embedded with `go:embed`, so building drover itself needs no Node. Changing it
+does:
+
+```bash
+cd web && npm install && npm run build   # rewrites internal/web/dist
+go build ./cmd/drover                    # the binary embeds it -- rebuild too
+```
+
+That second line is not optional. The assets live inside the binary, so a
+`npm run build` alone changes nothing that a running `drover serve` will
+serve.
 
 ## License
 

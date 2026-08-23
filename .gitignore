@@ -1,3 +1,4 @@
 # build output
 /drover
 /dist/
+web/node_modules/

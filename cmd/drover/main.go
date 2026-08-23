@@ -3,21 +3,31 @@
 package main
 
 import (
+	"context"
 	"fmt"
 	"os"
+	"os/signal"
+	"syscall"
 )
 
 // Version is the build version, overridden at release with -ldflags.
 var Version = "dev"
 
 func main() {
-	if err := run(os.Args[1:]); err != nil {
+	// One context for the process, cancelled by Ctrl-C or SIGTERM. Every
+	// command takes it, so an interrupt reaches the work itself -- a long
+	// clone, a slow query, a grep across every checkout -- instead of only
+	// killing the process once the call it is inside finally returns.
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+
+	if err := run(ctx, os.Args[1:]); err != nil {
 		fmt.Fprintln(os.Stderr, "drover: "+err.Error())
 		os.Exit(1)
 	}
 }
 
-func run(args []string) error {
+func run(ctx context.Context, args []string) error {
 	if len(args) == 0 {
 		usage(os.Stdout)
 		return nil
@@ -26,29 +36,29 @@ func run(args []string) error {
 	cmd, rest := args[0], args[1:]
 	switch cmd {
 	case "serve":
-		return cmdServe(rest)
+		return cmdServe(ctx, rest)
 	case "apply":
-		return cmdApply(rest)
+		return cmdApply(ctx, rest)
 	case "get":
-		return cmdGet(rest)
+		return cmdGet(ctx, rest)
 	case "delete":
-		return cmdDelete(rest)
+		return cmdDelete(ctx, rest)
 	case "sync":
-		return cmdSync(rest)
+		return cmdSync(ctx, rest)
 	case "dash", "dashboard":
-		return cmdDash(rest)
+		return cmdDash(ctx, rest)
 	case "mcp":
-		return cmdMCP(rest)
+		return cmdMCP(ctx, rest)
 	case "call":
-		return cmdCall(rest)
+		return cmdCall(ctx, rest)
 	case "query":
-		return cmdQuery(rest)
+		return cmdQuery(ctx, rest)
 	case "health":
-		return cmdHealth(rest)
+		return cmdHealth(ctx, rest)
 	case "forget":
-		return cmdForget(rest)
+		return cmdForget(ctx, rest)
 	case "upgrade", "update", "self-update":
-		return cmdUpgrade(rest)
+		return cmdUpgrade(ctx, rest)
 	case "version", "--version", "-v":
 		fmt.Println("drover " + Version)
 		return nil

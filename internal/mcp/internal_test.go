@@ -1,7 +1,11 @@
 package mcp
 
 import (
+	"context"
 	"errors"
+	"net/http"
+	"net/http/httptest"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -100,7 +104,7 @@ type stubBackend struct {
 	down bool
 }
 
-func (b *stubBackend) List(kind object.Kind) ([]api.ObjectView, error) {
+func (b *stubBackend) List(_ context.Context, kind object.Kind) ([]api.ObjectView, error) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	if b.down {
@@ -112,7 +116,7 @@ func (b *stubBackend) List(kind object.Kind) ([]api.ObjectView, error) {
 	return nil, nil
 }
 
-func (b *stubBackend) LSP(api.LSPRequest) (*api.LSPResponse, error) {
+func (b *stubBackend) LSP(context.Context, api.LSPRequest) (*api.LSPResponse, error) {
 	return &api.LSPResponse{}, nil
 }
 
@@ -241,4 +245,176 @@ func TestToolWatchStartsOnce(t *testing.T) {
 		t.Fatal("three starts produced more than one watcher")
 	case <-time.After(80 * time.Millisecond):
 	}
+}
+
+// blockingBackend hangs in Grep until its context is done, and reports which
+// way it ended.
+type blockingBackend struct {
+	Backend
+	entered chan struct{}
+	ended   chan error
+}
+
+func (b *blockingBackend) List(context.Context, object.Kind) ([]api.ObjectView, error) {
+	return nil, nil
+}
+
+func (b *blockingBackend) Grep(ctx context.Context, _ api.GrepRequest) (*api.GrepResponse, error) {
+	close(b.entered)
+	select {
+	case <-ctx.Done():
+		b.ended <- ctx.Err()
+		return nil, ctx.Err()
+	case <-time.After(5 * time.Second):
+		b.ended <- errors.New("never cancelled")
+		return nil, errors.New("never cancelled")
+	}
+}
+
+// A tool call must be cancellable end to end. Before the context was threaded
+// through the router, a client that hung up left the work running: the HTTP
+// request context existed but stopped at the transport, and every Backend call
+// below it was made with context.Background().
+func TestHTTPToolCallIsCancelledWhenTheClientHangsUp(t *testing.T) {
+	b := &blockingBackend{entered: make(chan struct{}), ended: make(chan error, 1)}
+	h := (&Server{Backend: b, Version: "test"}).HTTPHandler()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	body := `{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"grep","arguments":{"pattern":"x"}}}`
+	req := httptest.NewRequest(http.MethodPost, "/mcp", strings.NewReader(body)).WithContext(ctx)
+	req.Header.Set("Content-Type", "application/json")
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		h.ServeHTTP(httptest.NewRecorder(), req)
+	}()
+
+	select {
+	case <-b.entered:
+	case <-time.After(2 * time.Second):
+		t.Fatal("the grep never reached the backend")
+	}
+	cancel()
+
+	select {
+	case err := <-b.ended:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("backend ended with %v, want context.Canceled", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("cancelling the request did not reach the backend")
+	}
+	<-done
+}
+
+// The half of listChanged that was missing. The stdio bridge has announced a
+// changed tool list since the tool set was built; over HTTP, GET was answered
+// with 405 and the docs said the transport had no channel for a
+// server-initiated message. It does -- the client opens a GET and the server
+// writes events down it -- and this is that path end to end.
+func TestHTTPStreamDeliversToolChange(t *testing.T) {
+	restore := toolChangePoll
+	toolChangePoll = 5 * time.Millisecond
+	t.Cleanup(func() { toolChangePoll = restore })
+
+	backend := &stubBackend{}
+	srv := &Server{Backend: backend, Version: "test"}
+	h := srv.HTTPHandler()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	req := httptest.NewRequest(http.MethodGet, "/mcp", nil).WithContext(ctx)
+	req.Header.Set("Accept", "text/event-stream")
+	// Not httptest.ResponseRecorder: the handler writes from its own goroutine
+	// while the test reads, and the recorder is not safe for that.
+	rec := newStreamRecorder()
+
+	streamed := make(chan struct{})
+	go func() {
+		defer close(streamed)
+		h.ServeHTTP(rec, req)
+	}()
+
+	// Wait for the subscription, so the change cannot land before anyone is
+	// listening -- which would make this test pass or fail on scheduling.
+	waitFor(t, func() bool { return srv.hub.listeners() == 1 })
+
+	backend.set(func(b *stubBackend) {
+		b.sql = []api.ObjectView{{Kind: "SQLConnection", Name: "analytics", Provider: "postgres", Status: "ready"}}
+	})
+
+	waitFor(t, func() bool {
+		return strings.Contains(rec.body(), "notifications/tools/list_changed")
+	})
+
+	if ct := rec.Header().Get("Content-Type"); ct != "text/event-stream" {
+		t.Errorf("Content-Type = %q, want text/event-stream", ct)
+	}
+	if !strings.HasPrefix(rec.body(), "data: ") {
+		t.Errorf("frame is not SSE-shaped: %q", rec.body())
+	}
+
+	cancel()
+	<-streamed
+
+	// The watcher exists to tell somebody. With the last stream gone there is
+	// nobody, and it must stop rather than poll the store forever.
+	waitFor(t, func() bool {
+		srv.hub.mu.Lock()
+		defer srv.hub.mu.Unlock()
+		return !srv.hub.watching
+	})
+}
+
+// A GET that did not ask for the stream keeps the old refusal: it is a client
+// that does not know about it, or a person with a browser, and neither wants a
+// connection that hangs open forever.
+func TestHTTPPlainGetIsStillRefused(t *testing.T) {
+	h := (&Server{Backend: &stubBackend{}, Version: "test"}).HTTPHandler()
+
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/mcp", nil))
+	if rec.Code != http.StatusMethodNotAllowed {
+		t.Fatalf("status %d, want 405", rec.Code)
+	}
+}
+
+func waitFor(t *testing.T, cond func() bool) {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if cond() {
+			return
+		}
+		time.Sleep(time.Millisecond)
+	}
+	t.Fatal("condition never became true")
+}
+
+// streamRecorder is a ResponseWriter that may be read while it is being
+// written, which an open event stream requires and httptest's does not allow.
+type streamRecorder struct {
+	mu  sync.Mutex
+	buf strings.Builder
+	hdr http.Header
+}
+
+func newStreamRecorder() *streamRecorder { return &streamRecorder{hdr: http.Header{}} }
+
+func (r *streamRecorder) Header() http.Header { return r.hdr }
+func (r *streamRecorder) WriteHeader(int)     {}
+func (r *streamRecorder) Flush()              {}
+
+func (r *streamRecorder) Write(p []byte) (int, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.buf.Write(p)
+}
+
+func (r *streamRecorder) body() string {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.buf.String()
 }

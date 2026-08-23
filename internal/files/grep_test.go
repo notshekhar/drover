@@ -1,6 +1,8 @@
 package files
 
 import (
+	"context"
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -36,7 +38,7 @@ func vendorTree(t *testing.T) *Root {
 func TestGrepSkipsVendorAndBuildDirs(t *testing.T) {
 	r := vendorTree(t)
 
-	res, err := r.Grep("export function", GrepOptions{})
+	res, err := r.Grep(context.Background(), "export function", GrepOptions{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -56,7 +58,7 @@ func TestGrepSkipsVendorAndBuildDirs(t *testing.T) {
 func TestGrepSearchesVendorWhenNamed(t *testing.T) {
 	r := vendorTree(t)
 
-	res, err := r.Grep("export function", GrepOptions{Path: "web/node_modules"})
+	res, err := r.Grep(context.Background(), "export function", GrepOptions{Path: "web/node_modules"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -78,7 +80,7 @@ func TestGrepResultsAreSorted(t *testing.T) {
 		}
 	}
 
-	res, err := r.Grep("hit", GrepOptions{})
+	res, err := r.Grep(context.Background(), "hit", GrepOptions{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -111,7 +113,7 @@ func TestGrepEndAnchorOnCRLF(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	res, err := r.Grep("alpha$", GrepOptions{})
+	res, err := r.Grep(context.Background(), "alpha$", GrepOptions{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -139,7 +141,7 @@ func TestGrepLargeFileFallsBackToStreaming(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	res, err := r.Grep("needle", GrepOptions{})
+	res, err := r.Grep(context.Background(), "needle", GrepOptions{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -163,7 +165,7 @@ func TestGrepTruncatesAfterSorting(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	res, err := r.Grep("hit", GrepOptions{MaxResults: 5})
+	res, err := r.Grep(context.Background(), "hit", GrepOptions{MaxResults: 5})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -188,4 +190,42 @@ func itoa(n int) string {
 		n /= 10
 	}
 	return string(b)
+}
+
+// A search across every checkout is the longest-running thing drover does on
+// its own CPU, and until the context reached it there was no way to stop one:
+// a client that hung up left the walk running to completion against a caller
+// nobody was waiting on.
+func TestGrepStopsOnCancelledContext(t *testing.T) {
+	r := vendorTree(t)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	if _, err := r.Grep(ctx, "export function", GrepOptions{}); !errors.Is(err, context.Canceled) {
+		t.Fatalf("grep with a cancelled context: got %v, want context.Canceled", err)
+	}
+	if _, err := r.Find(ctx, "*.ts", "", 0); !errors.Is(err, context.Canceled) {
+		t.Fatalf("find with a cancelled context: got %v, want context.Canceled", err)
+	}
+}
+
+// Cancelling while the workers are running must not deadlock or double-close
+// the queue that feeds them: the cancel path closes it and waits, and the
+// normal path closes it again straight after. Whether this particular run
+// gets far enough to be cancelled is a race, which is the point -- both
+// outcomes have to be safe.
+func TestGrepCancelDuringWorkIsSafe(t *testing.T) {
+	r := vendorTree(t)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	// A pattern that matches everything, cancelled after the walk has started
+	// collecting but before the workers can drain a full tree.
+	go cancel()
+	_, err := r.Grep(ctx, ".", GrepOptions{})
+	if err != nil && !errors.Is(err, context.Canceled) {
+		t.Fatalf("unexpected error: %v", err)
+	}
 }
