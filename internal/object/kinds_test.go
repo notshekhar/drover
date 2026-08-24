@@ -340,17 +340,30 @@ func TestSQLRejectsUnknownProvider(t *testing.T) {
 	}
 }
 
-// A DSN with a password in a file people commit is a leaked credential.
-func TestSQLRejectsInlinePassword(t *testing.T) {
-	_, err := Parse("sql.yaml", []byte(sqlDoc("  url: postgres://user:hunter2@host/db\n")))
-	if err == nil {
-		t.Fatal("a url with an inline password was accepted")
-	}
-	if !strings.Contains(err.Error(), "${ENV_VAR}") {
-		t.Errorf("error = %q, want it to point at the fix", err)
+// An inline password is legal now -- a DSN with a password in a file people
+// commit is a leak waiting to happen, but it is the user's file -- and it is
+// called out as a warning, not an error.
+func TestSQLAllowsInlinePassword(t *testing.T) {
+	objs, err := Parse("sql.yaml", []byte(sqlDoc("  url: postgres://user:hunter2@host/db\n")))
+	if err != nil {
+		t.Fatalf("a url with an inline password was rejected: %v", err)
 	}
 
-	// Without a password it is fine.
+	b := NewBatch()
+	if err := b.AddAll(objs); err != nil {
+		t.Fatal(err)
+	}
+	warnings := b.Warnings()
+	if len(warnings) != 1 {
+		t.Fatalf("got %d warnings, want 1: %v", len(warnings), warnings)
+	}
+	for _, want := range []string{"prod", "${ENV_VAR}"} {
+		if !strings.Contains(warnings[0], want) {
+			t.Errorf("warning = %q, want it to name %q", warnings[0], want)
+		}
+	}
+
+	// A passwordless url is fine and does not warn.
 	if _, err := Parse("sql.yaml", []byte(sqlDoc("  url: postgres://user@host/db\n"))); err != nil {
 		t.Errorf("a passwordless url was rejected: %v", err)
 	}

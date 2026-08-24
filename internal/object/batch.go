@@ -142,7 +142,9 @@ func (b *Batch) checkEnvironmentRefs(existing map[Ref]bool) error {
 //
 // Two Repository objects pointing at the same url and branch is legal -- that
 // is two checkouts, deliberately -- but it is also exactly what a copy-pasted
-// document looks like, so it is worth a line on stderr.
+// document looks like, so it is worth a line on stderr. Likewise a SQLConnection
+// url carrying a password works, but a credential in a file people commit is
+// a leak waiting to happen, so it is called out.
 func (b *Batch) Warnings() []string {
 	type target struct{ url, branch string }
 	byTarget := map[target][]string{}
@@ -166,6 +168,25 @@ func (b *Batch) Warnings() []string {
 		sort.Strings(names)
 		out = append(out, fmt.Sprintf("%d repositories clone %s branch %s: %s",
 			len(names), t.url, t.branch, strings.Join(names, ", ")))
+	}
+
+	// An inline password is legal now, but it is still a credential sitting in
+	// a file people commit, so it warns. ${ENV} references hide the password
+	// from the file and never warn.
+	for _, o := range b.Objects {
+		if o.Kind != KindSQLConnection {
+			continue
+		}
+		spec, err := o.SQLConnection()
+		if err != nil {
+			continue
+		}
+		if isSingleProcessEnvRef(strings.TrimSpace(spec.URL)) {
+			continue
+		}
+		if err := checkNoInlinePassword(spec.URL); err != nil {
+			out = append(out, fmt.Sprintf("%s: spec.url has a password in it; prefer a ${ENV_VAR} reference so the credential is not in a file people commit", o.Ref()))
+		}
 	}
 	sort.Strings(out)
 	return out
