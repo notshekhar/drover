@@ -56,6 +56,11 @@ type Options struct {
 	// since there would be nothing to re-read.
 	ConfigPath string
 
+	// AllowInlinePasswords accepts a password inside a SQLConnection url in
+	// applied and bootstrapped documents. Off by default: a credential in a
+	// file people commit is a leak.
+	AllowInlinePasswords bool
+
 	// ServersDir is where language servers are installed. Empty means
 	// ~/.drover/servers.
 	ServersDir string
@@ -95,6 +100,10 @@ type Server struct {
 	mu      sync.Mutex
 	httpSrv *http.Server
 
+	// allowInlinePasswords is opts.AllowInlinePasswords, kept on the struct
+	// so readBatch can hand it to every parse.
+	allowInlinePasswords bool
+
 	// The watcher's cached parse of the config file, keyed on its size and
 	// mtime. The watcher ticks once a second forever, so this is the
 	// difference between an idle engine parsing yaml 86,400 times a day and
@@ -114,13 +123,14 @@ func New(opts Options) (*Server, error) {
 		return nil, err
 	}
 	s := &Server{
-		opts:  opts,
-		store: st,
-		repo:  repo.New(opts.DataDir),
-		http:  httpreq.New(),
-		sql:   sqldb.NewPool(),
-		files: files.New(opts.DataDir),
-		git:   git.New(opts.DataDir),
+		opts:                 opts,
+		store:                st,
+		repo:                 repo.New(opts.DataDir),
+		http:                 httpreq.New(),
+		sql:                  sqldb.NewPool(),
+		files:                files.New(opts.DataDir),
+		git:                  git.New(opts.DataDir),
+		allowInlinePasswords: opts.AllowInlinePasswords,
 
 		started: time.Now(),
 	}
@@ -390,7 +400,11 @@ func (s *Server) readBatch(files []string) (*object.Batch, error) {
 		if err != nil {
 			return nil, err
 		}
-		objs, err := object.Parse(f, data)
+		opts := []object.ParseOption{}
+		if s.allowInlinePasswords {
+			opts = append(opts, object.AllowInlinePasswords())
+		}
+		objs, err := object.Parse(f, data, opts...)
 		if err != nil {
 			return nil, err
 		}
@@ -594,7 +608,11 @@ func (s *Server) handleApply(w http.ResponseWriter, r *http.Request) {
 
 	batch := object.NewBatch()
 	for _, doc := range req.Documents {
-		objs, err := object.Parse(doc.Source, []byte(doc.Data))
+		opts := []object.ParseOption{}
+		if req.AllowInlinePasswords {
+			opts = append(opts, object.AllowInlinePasswords())
+		}
+		objs, err := object.Parse(doc.Source, []byte(doc.Data), opts...)
 		if err != nil {
 			writeErr(w, http.StatusBadRequest, err)
 			return

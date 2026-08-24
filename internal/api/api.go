@@ -21,6 +21,10 @@ type Document struct {
 // document and writes either all of them or none.
 type ApplyRequest struct {
 	Documents []Document `json:"documents"`
+
+	// AllowInlinePasswords accepts a password inside a SQLConnection url.
+	// Off by default: a credential in a file people commit is a leak.
+	AllowInlinePasswords bool `json:"allowInlinePasswords,omitempty"`
 }
 
 // Action is what an apply did to one object.

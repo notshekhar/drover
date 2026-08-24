@@ -29,6 +29,7 @@ func cmdApply(ctx context.Context, args []string) error {
 		configFlag   = fs.String("config", "", "config file (default <data-dir>/config.yaml)")
 		serverFlag   = fs.String("server", "", "engine to talk to")
 		noRememberFl = fs.Bool("no-remember", false, "do not add these paths to the config apply list")
+		passwordsFl  = fs.Bool("allow-inline-passwords", false, "accept a password inside a SQLConnection url (default: reject; use a ${ENV} reference instead)")
 	)
 	if err := fs.Parse(args); err != nil {
 		return err
@@ -58,7 +59,7 @@ func cmdApply(ctx context.Context, args []string) error {
 	// Validate locally first. The server checks everything again -- it does
 	// not trust its client -- but failing here means a typo does not need a
 	// round trip, and the error names the file the user is looking at.
-	if err := validateLocally(docs); err != nil {
+	if err := validateLocally(docs, *passwordsFl); err != nil {
 		return err
 	}
 
@@ -66,7 +67,7 @@ func cmdApply(ctx context.Context, args []string) error {
 	if err != nil {
 		return err
 	}
-	resp, err := client.New(url).Apply(ctx, docs)
+	resp, err := client.New(url).Apply(ctx, docs, *passwordsFl)
 	if err != nil {
 		return err
 	}
@@ -133,10 +134,14 @@ func collectDocuments(paths []string) (docs []api.Document, remember []string, e
 
 // validateLocally runs the same parse and batch rules the server will, so the
 // common mistakes are caught before anything is sent.
-func validateLocally(docs []api.Document) error {
+func validateLocally(docs []api.Document, allowInlinePasswords bool) error {
 	batch := object.NewBatch()
 	for _, d := range docs {
-		objs, err := object.Parse(d.Source, []byte(d.Data))
+		opts := []object.ParseOption{}
+		if allowInlinePasswords {
+			opts = append(opts, object.AllowInlinePasswords())
+		}
+		objs, err := object.Parse(d.Source, []byte(d.Data), opts...)
 		if err != nil {
 			return err
 		}

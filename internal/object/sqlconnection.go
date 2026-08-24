@@ -78,9 +78,13 @@ type SQLConnectionSpec struct {
 	Provider string `yaml:"provider,omitempty"`
 
 	// URL should be a ${ENV} reference. A literal DSN in a file people commit
-	// is a leaked credential, so an inline password is warned about, not
-	// rejected.
+	// is a leaked credential, so a literal is allowed only when it carries no
+	// password, or when the apply asked for passwords explicitly.
 	URL string `yaml:"url"`
+
+	// allowInlinePasswords is validation policy set by the caller, never part
+	// of the document.
+	allowInlinePasswords bool
 
 	// Health gates the tool: no health query, or a failing one, means no sql
 	// tool is advertised at all.
@@ -163,6 +167,15 @@ func (s *SQLConnectionSpec) Validate() error {
 	}
 	if _, err := s.ResolveProvider(); err != nil {
 		return err
+	}
+
+	// A DSN with an inline password in a file people commit is a leaked
+	// credential. References are always fine; a literal is allowed only when
+	// it carries no password, or when the apply asked for passwords.
+	if !s.allowInlinePasswords && !isSingleProcessEnvRef(strings.TrimSpace(s.URL)) {
+		if err := checkNoInlinePassword(s.URL); err != nil {
+			return err
+		}
 	}
 
 	if s.MaxRows < 0 {

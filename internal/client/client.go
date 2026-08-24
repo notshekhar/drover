@@ -131,8 +131,11 @@ func (c *Client) Status(ctx context.Context) (*api.StatusResponse, error) {
 }
 
 // Apply sends a whole batch. The server writes all of it or none.
-func (c *Client) Apply(ctx context.Context, docs []api.Document) (*api.ApplyResponse, error) {
-	body, err := json.Marshal(api.ApplyRequest{Documents: docs})
+//
+// allowInlinePasswords opts into accepting a password inside a SQLConnection
+// url; the default rejects one.
+func (c *Client) Apply(ctx context.Context, docs []api.Document, allowInlinePasswords bool) (*api.ApplyResponse, error) {
+	body, err := json.Marshal(api.ApplyRequest{Documents: docs, AllowInlinePasswords: allowInlinePasswords})
 	if err != nil {
 		return nil, err
 	}

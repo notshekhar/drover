@@ -158,6 +158,38 @@ spec:
 	}
 }
 
+// An inline password is a leaked credential, so it is refused unless the
+// apply asked for it explicitly.
+func TestApplySQLConnectionInlinePassword(t *testing.T) {
+	s, _ := newServer(t)
+	sql := `apiVersion: drover/v1
+kind: SQLConnection
+metadata:
+  name: prod
+spec:
+  url: postgres://user:hunter2@host/db
+  health: SELECT 1
+`
+
+	rec, _ := apply(t, s, doc("/work/sql.yaml", sql))
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status %d, want 400 for an inline password: %s", rec.Code, rec.Body)
+	}
+
+	// The same document applies when the request opts in.
+	body, err := json.Marshal(api.ApplyRequest{Documents: []api.Document{doc("/work/sql.yaml", sql)}, AllowInlinePasswords: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	req := httptest.NewRequest(http.MethodPost, api.Prefix+"/apply", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	rec2 := httptest.NewRecorder()
+	s.Handler().ServeHTTP(rec2, req)
+	if rec2.Code != http.StatusOK {
+		t.Errorf("status %d, want 200 with the flag: %s", rec2.Code, rec2.Body)
+	}
+}
+
 // An HTTPRequest may reference an Environment applied in an earlier batch,
 // not only one in its own.
 func TestApplyHTTPRequestAgainstStoredEnvironment(t *testing.T) {

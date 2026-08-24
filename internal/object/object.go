@@ -100,6 +100,27 @@ type Object struct {
 	// Index is the 0-based position of this document within its source, so a
 	// multi-doc file can point at the offending document.
 	Index int `yaml:"-"`
+
+	// allowInlinePasswords is set by the Parse option of the same name. It is
+	// validation policy, never part of the document.
+	allowInlinePasswords bool
+}
+
+// ParseOption tweaks how Parse validates. The zero options are the secure
+// defaults.
+type ParseOption func(*parseOptions)
+
+type parseOptions struct {
+	allowInlinePasswords bool
+}
+
+// AllowInlinePasswords accepts a password inside a SQLConnection url.
+//
+// The default rejects one, because a credential sitting in a file people
+// commit is a leak waiting to happen. Passing this says the caller knows the
+// file it is applying is not a shared repository.
+func AllowInlinePasswords() ParseOption {
+	return func(o *parseOptions) { o.allowInlinePasswords = true }
 }
 
 // Ref is the identity of an object, and how it is named in errors.
@@ -128,7 +149,12 @@ func (o *Object) Where() string {
 // Each document is validated on its own. Parse stops at the first invalid
 // document, because apply is all-or-nothing anyway and a wall of errors from
 // one bad indent helps nobody.
-func Parse(source string, data []byte) ([]*Object, error) {
+func Parse(source string, data []byte, opts ...ParseOption) ([]*Object, error) {
+	var po parseOptions
+	for _, opt := range opts {
+		opt(&po)
+	}
+
 	dec := yaml.NewDecoder(bytes.NewReader(data))
 	var out []*Object
 	for i := 0; ; i++ {
@@ -149,6 +175,7 @@ func Parse(source string, data []byte) ([]*Object, error) {
 			return nil, fmt.Errorf("%s: document %d: %w", source, i+1, err)
 		}
 		obj.Source, obj.Index = source, i
+		obj.allowInlinePasswords = po.allowInlinePasswords
 		// Provenance is the server's to write, not the document's.
 		obj.Metadata.Source, obj.Metadata.AppliedAt = "", ""
 		if err := obj.Validate(); err != nil {
@@ -211,6 +238,7 @@ func (o *Object) Validate() error {
 		if err != nil {
 			return err
 		}
+		spec.allowInlinePasswords = o.allowInlinePasswords
 		return spec.Validate()
 	}
 	return nil

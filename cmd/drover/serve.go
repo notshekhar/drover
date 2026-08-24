@@ -33,6 +33,7 @@ func cmdServe(ctx context.Context, args []string) error {
 		listenFlag  = fs.String("listen", "", "address to bind (default from config, else "+config.DefaultListen+")")
 		syncFlag    = fs.String("sync", "", "default refresh interval for repositories that do not set one (e.g. 30m, never)")
 		noTUIFlag   = fs.Bool("no-tui", false, "log plainly instead of drawing the dashboard")
+		passwordsFl = fs.Bool("allow-inline-passwords", false, "accept a password inside a SQLConnection url in applied files (default: reject; use a ${ENV} reference instead)")
 	)
 	if err := fs.Parse(args); err != nil {
 		return err
@@ -76,12 +77,13 @@ func cmdServe(ctx context.Context, args []string) error {
 	}
 
 	srv, err := server.New(server.Options{
-		DataDir:    dataDir,
-		Listen:     listen,
-		Version:    Version,
-		Log:        engineLog,
-		Sync:       cfg.SyncInterval(),
-		ConfigPath: cfgPath,
+		DataDir:              dataDir,
+		Listen:               listen,
+		Version:              Version,
+		Log:                  engineLog,
+		Sync:                 cfg.SyncInterval(),
+		ConfigPath:           cfgPath,
+		AllowInlinePasswords: *passwordsFl,
 	})
 	if err != nil {
 		return err
