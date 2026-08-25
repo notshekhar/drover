@@ -38,6 +38,39 @@ func (b *recordingBackend) List(ctx context.Context, kind object.Kind) ([]api.Ob
 	return b.inner.List(ctx, kind)
 }
 
+// DocWrite is recorded like any other tool call, and more carefully than
+// most: it is the only one that changes anything.
+func (b *recordingBackend) DocWrite(ctx context.Context, store string, req api.DocWriteRequest) (*api.DocWriteResponse, error) {
+	start := time.Now()
+	res, err := b.inner.DocWrite(ctx, store, req)
+	rec := activity.Record{
+		Tool:   "doc_write",
+		Args:   map[string]any{"store": store, "path": req.Path, "bytes": len(req.Content)},
+		Reason: req.Reason,
+		Object: store,
+	}
+	if err == nil && res != nil {
+		rec.Bytes = res.Bytes
+		rec.Outcome = "ok"
+		switch {
+		case res.Unchanged:
+			rec.Summary = res.Path + " · unchanged"
+		case res.Created:
+			rec.Summary = res.Path + " · created · " + res.Commit
+		default:
+			rec.Summary = res.Path + " · updated · " + res.Commit
+		}
+	}
+	b.finish(ctx, rec, start, err)
+	return res, err
+}
+
+// Hotspots is not a tool call and is not recorded. Recording the query that
+// reads the log into the log would be a feedback loop with nothing in it.
+func (b *recordingBackend) Hotspots(ctx context.Context) (*api.HotspotsResponse, error) {
+	return b.inner.Hotspots(ctx)
+}
+
 func (b *recordingBackend) Get(ctx context.Context, kind object.Kind, name string) (*api.ObjectView, error) {
 	return b.inner.Get(ctx, kind, name)
 }
