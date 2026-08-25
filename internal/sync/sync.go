@@ -14,15 +14,33 @@ import (
 	"sync"
 	"time"
 
+	"github.com/notshekhar/drover/internal/mirror"
 	"github.com/notshekhar/drover/internal/object"
 	"github.com/notshekhar/drover/internal/repo"
+	"github.com/notshekhar/drover/internal/repoconfig"
 	"github.com/notshekhar/drover/internal/store"
 )
+
+// Mirrorer keeps the discussion around a checkout beside it. It is an
+// interface so the sync package does not depend on GitHub, and so a test can
+// run the loop without one.
+type Mirrorer interface {
+	Sync(ctx context.Context, name, repoURL, checkout string, spec *object.MirrorSpec) (*mirror.Result, error)
+}
+
+// SelfDescriber applies the objects a repository declares about itself. It
+// is an interface for the same reason Mirrorer is: the sync loop should not
+// know how the store works.
+type SelfDescriber interface {
+	Apply(ctx context.Context, name string, spec *object.RepositorySpec) (string, error)
+}
 
 // Manager owns one worker per repository.
 type Manager struct {
 	store    *store.Store
 	rec      *repo.Reconciler
+	mirror   Mirrorer
+	selfdesc SelfDescriber
 	onChange func(string)
 	def      time.Duration
 	log      io.Writer
@@ -54,6 +72,13 @@ type Options struct {
 	Default time.Duration // server-wide default for objects that set none
 	Log     io.Writer
 
+	// Mirror, when set, refreshes a repository's issues and pull requests
+	// after its checkout reconciles.
+	Mirror Mirrorer
+
+	// SelfDescribe, when set, reads the checkout's own .drover.yaml.
+	SelfDescribe SelfDescriber
+
 	// OnCommitChanged is called after a reconcile that moved the checkout to a
 	// different commit.
 	//
@@ -72,6 +97,8 @@ func New(opts Options) *Manager {
 	return &Manager{
 		store:    opts.Store,
 		rec:      opts.Repo,
+		mirror:   opts.Mirror,
+		selfdesc: opts.SelfDescribe,
 		def:      opts.Default,
 		log:      opts.Log,
 		onChange: opts.OnCommitChanged,
@@ -260,6 +287,53 @@ func (m *Manager) run(ctx context.Context, w *worker) {
 	}
 }
 
+// mirrorDiscussion refreshes the issues and pull requests beside a checkout.
+//
+// A mirror failure is recorded against the mirror, never against the
+// repository. GitHub being unreachable, or a token being absent, does not
+// make the checkout any less searchable, and marking the repository failed
+// would tell an agent to stop reading a tree that is perfectly fine.
+func (m *Manager) mirrorDiscussion(ctx context.Context, name string, spec *object.RepositorySpec) {
+	if m.mirror == nil || !spec.Mirror.Enabled() {
+		return
+	}
+	res, err := m.mirror.Sync(ctx, name, spec.URL, m.rec.Path(name), spec.Mirror)
+	if ctx.Err() != nil {
+		return // shutting down
+	}
+	if err != nil {
+		m.logf("repository %s: mirror: %v", name, err)
+		_ = m.store.SetMirror(object.KindRepository, name, "", err)
+		return
+	}
+	if res == nil {
+		return
+	}
+	_ = m.store.SetMirror(object.KindRepository, name, res.Summary(), nil)
+}
+
+// readSelfDescription applies what the checkout says about itself.
+//
+// Like the mirror, a failure here is recorded against the thing that failed
+// and never against the repository: a malformed .drover.yaml is somebody
+// else's mistake in somebody else's repository, and the checkout is still
+// perfectly searchable.
+func (m *Manager) readSelfDescription(ctx context.Context, name string, spec *object.RepositorySpec) {
+	if m.selfdesc == nil {
+		return
+	}
+	summary, err := m.selfdesc.Apply(ctx, name, spec)
+	if ctx.Err() != nil {
+		return
+	}
+	if err != nil {
+		m.logf("repository %s: %s: %v", name, repoconfig.FileName, err)
+		_ = m.store.SetConfig(object.KindRepository, name, "", err)
+		return
+	}
+	_ = m.store.SetConfig(object.KindRepository, name, summary, nil)
+}
+
 // reconcile runs one attempt and records what happened. A failure is stored
 // and retried on the next tick rather than killing the worker -- a remote
 // that is down for an hour should not need a restart to recover.
@@ -294,6 +368,8 @@ func (m *Manager) reconcile(ctx context.Context, name string) {
 	}
 
 	_ = m.store.MarkReady(object.KindRepository, name, res.Commit, res.Branch)
+	m.mirrorDiscussion(ctx, name, spec)
+	m.readSelfDescription(ctx, name, spec)
 	if m.onChange != nil && res.Commit != before {
 		m.onChange(name)
 	}

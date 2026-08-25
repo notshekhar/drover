@@ -16,6 +16,67 @@ type RepositorySpec struct {
 	// working in can pull every few minutes while a vendored reference repo
 	// sits at a day. Unset means the server default.
 	RefreshInterval Interval `yaml:"refreshInterval"`
+
+	// TrustConfig applies the objects a repository declares in its own
+	// .drover.yaml.
+	//
+	// Off by default, and that is the whole point. A yaml file inside a clone
+	// is written by whoever can push to that repository, which is not
+	// necessarily the person running this engine. Until this is set, objects
+	// found there are parsed, shown and inert.
+	TrustConfig bool `yaml:"trustConfig,omitempty"`
+
+	// Mirror pulls the discussion around the code -- issues and pull
+	// requests -- down beside the checkout as markdown.
+	//
+	// git says what changed and who changed it. It cannot say why, because
+	// why was argued in a pull request. Unset means no mirroring.
+	Mirror *MirrorSpec `yaml:"mirror,omitempty"`
+}
+
+// MirrorSpec says which discussion to keep beside a checkout.
+type MirrorSpec struct {
+	Issues       bool `yaml:"issues"`
+	PullRequests bool `yaml:"pullRequests"`
+
+	// Comments pulls the discussion as well as the opening body. It is the
+	// expensive half and the valuable half: an issue body states a problem,
+	// the thread states what was decided about it.
+	Comments *bool `yaml:"comments,omitempty"`
+
+	// Since bounds the backfill: 90d, 6h, or all. A repository with 40,000
+	// issues is 400 API pages, so the default is a year, not everything.
+	Since Window `yaml:"since,omitempty"`
+
+	// State is "all" or "open". Closed issues are where the answers are, so
+	// the default is all.
+	State string `yaml:"state,omitempty"`
+}
+
+// WantComments reports whether the thread is mirrored, defaulting to true.
+func (m *MirrorSpec) WantComments() bool {
+	return m.Comments == nil || *m.Comments
+}
+
+// Enabled reports whether there is anything to mirror.
+func (m *MirrorSpec) Enabled() bool {
+	return m != nil && (m.Issues || m.PullRequests)
+}
+
+// Validate checks a mirror block.
+func (m *MirrorSpec) Validate() error {
+	if m == nil {
+		return nil
+	}
+	if !m.Issues && !m.PullRequests {
+		return errors.New("set issues, pullRequests or both -- a mirror block that asks for neither does nothing")
+	}
+	switch m.State {
+	case "", "all", "open":
+	default:
+		return fmt.Errorf("state is %q; use \"all\" or \"open\"", m.State)
+	}
+	return nil
 }
 
 // Repository decodes this object's spec as a RepositorySpec.
@@ -43,6 +104,9 @@ func (s *RepositorySpec) Validate() error {
 	}
 	if err := validateBranch(s.Branch); err != nil {
 		return fmt.Errorf("spec.branch: %w", err)
+	}
+	if err := s.Mirror.Validate(); err != nil {
+		return fmt.Errorf("spec.mirror: %w", err)
 	}
 	return nil
 }

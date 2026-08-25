@@ -35,6 +35,28 @@ type Status struct {
 	LastAttempt string `yaml:"lastAttempt,omitempty"`
 	LastSuccess string `yaml:"lastSuccess,omitempty"`
 	Error       string `yaml:"error,omitempty"`
+
+	// Mirror is the one line the discussion mirror last reported.
+	//
+	// It is kept apart from Error because a mirror that cannot reach GitHub
+	// is not a checkout that failed: the code is still there and still
+	// searchable, and marking the whole repository failed over a missing
+	// token would tell an agent to stop reading a tree that is perfectly fine.
+	Mirror      string `yaml:"mirror,omitempty"`
+	MirrorError string `yaml:"mirrorError,omitempty"`
+
+	// Schema is where a SQLConnection's dumped shape landed, and SchemaError
+	// why it did not. Same reasoning as Mirror: a catalog query that failed
+	// does not make the connection unqueryable, so it does not belong in
+	// Error.
+	Schema      string `yaml:"schema,omitempty"`
+	SchemaError string `yaml:"schemaError,omitempty"`
+
+	// Config is what a repository's own .drover.yaml contributed, and
+	// ConfigError why it could not. Same reasoning again: a malformed file in
+	// somebody else's repository does not make the checkout unusable.
+	Config      string `yaml:"config,omitempty"`
+	ConfigError string `yaml:"configError,omitempty"`
 }
 
 func (s *Store) statusPath(kind object.Kind, name string) string {
@@ -94,16 +116,49 @@ func (s *Store) MarkSyncing(kind object.Kind, name string) error {
 	return s.SetStatus(kind, name, st)
 }
 
+// SetMirror records what the discussion mirror last did, leaving the rest of
+// the status alone.
+func (s *Store) SetMirror(kind object.Kind, name, summary string, cause error) error {
+	st, err := s.GetStatus(kind, name)
+	if err != nil || st == nil {
+		st = &Status{Phase: PhasePending}
+	}
+	st.Mirror = summary
+	st.MirrorError = ""
+	if cause != nil {
+		st.MirrorError = cause.Error()
+	}
+	return s.SetStatus(kind, name, st)
+}
+
+// SetConfig records what a repository's self-description contributed.
+func (s *Store) SetConfig(kind object.Kind, name, summary string, cause error) error {
+	st, err := s.GetStatus(kind, name)
+	if err != nil || st == nil {
+		st = &Status{Phase: PhasePending}
+	}
+	st.Config = summary
+	st.ConfigError = ""
+	if cause != nil {
+		st.ConfigError = cause.Error()
+	}
+	return s.SetStatus(kind, name, st)
+}
+
 // MarkReady records a successful reconcile.
 func (s *Store) MarkReady(kind object.Kind, name, commit, branch string) error {
 	ts := now()
-	return s.SetStatus(kind, name, &Status{
-		Phase:       PhaseReady,
-		Commit:      commit,
-		Branch:      branch,
-		LastAttempt: ts,
-		LastSuccess: ts,
-	})
+	// The mirror line survives a reconcile. It is observed state about a
+	// different thing on a different schedule, and rewriting the whole status
+	// from scratch here would silently blank it on every tick.
+	st := &Status{}
+	if prev, err := s.GetStatus(kind, name); err == nil && prev != nil {
+		st.Mirror, st.MirrorError = prev.Mirror, prev.MirrorError
+		st.Config, st.ConfigError = prev.Config, prev.ConfigError
+	}
+	st.Phase, st.Commit, st.Branch = PhaseReady, commit, branch
+	st.LastAttempt, st.LastSuccess = ts, ts
+	return s.SetStatus(kind, name, st)
 }
 
 // MarkFailed records a failure, keeping the last success so the table can say
