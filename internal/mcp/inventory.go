@@ -73,6 +73,9 @@ func (s *Server) renderInventory(ctx context.Context) string {
 	if sec := s.databaseSection(ctx); sec != "" {
 		sections = append(sections, sec)
 	}
+	if sec := s.hotspotSection(ctx); sec != "" {
+		sections = append(sections, sec)
+	}
 
 	if len(sections) == 0 {
 		return ""
@@ -137,7 +140,60 @@ func repositoryDetail(v api.ObjectView) string {
 		}
 		parts = append(parts, clip(detail, 100))
 	}
+	// A mirror is a second place to look for the same repository, and an
+	// agent that does not know it exists will never pass path=mirrors/<name>.
+	if v.Mirror != "" {
+		parts = append(parts, "mirrors/"+v.Name+": "+v.Mirror)
+	}
+	// Labels last, and only when there are any. They are what makes grep's
+	// `selector` usable: a selector nobody can see the vocabulary for is a
+	// parameter nobody will pass.
+	if len(v.Labels) > 0 {
+		parts = append(parts, inventoryLabels(v.Labels))
+	}
 	return strings.Join(parts, "  ")
+}
+
+// inventoryLabels renders a label set in a stable order.
+func inventoryLabels(labels map[string]string) string {
+	keys := make([]string, 0, len(labels))
+	for k := range labels {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	parts := make([]string, 0, len(keys))
+	for _, k := range keys {
+		parts = append(parts, k+"="+labels[k])
+	}
+	return "[" + strings.Join(parts, " ") + "]"
+}
+
+// maxInventoryHotspots caps the behavioural index in the handshake. It is
+// orientation, not a reading list.
+const maxInventoryHotspots = 8
+
+// hotspotSection is what the activity ledger has observed.
+//
+// Worded as observation and never as advice. "Agents here most often read" is
+// a fact about the past; "read these" is a recommendation drover has not
+// earned, and a model handed one will treat it as a shortcut and stop looking
+// anywhere else.
+func (s *Server) hotspotSection(ctx context.Context) string {
+	res, err := s.Backend.Hotspots(ctx)
+	if err != nil || res == nil || len(res.Hotspots) == 0 {
+		return ""
+	}
+	shown := res.Hotspots
+	if len(shown) > maxInventoryHotspots {
+		shown = shown[:maxInventoryHotspots]
+	}
+
+	var b strings.Builder
+	b.WriteString("MOST-READ FILES (observed, not a recommendation)\n")
+	for _, h := range shown {
+		fmt.Fprintf(&b, "  %s\n", h.Path)
+	}
+	return b.String()
 }
 
 func (s *Server) environmentSection(ctx context.Context) string {

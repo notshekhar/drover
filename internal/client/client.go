@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"strings"
 	"time"
 
@@ -157,11 +158,55 @@ func (c *Client) Get(ctx context.Context, kind object.Kind, name string) (*api.O
 
 // List fetches every object of one kind.
 func (c *Client) List(ctx context.Context, kind object.Kind) ([]api.ObjectView, error) {
+	return c.ListSelected(ctx, kind, "")
+}
+
+// ListSelected lists the objects of one kind whose labels match a selector.
+//
+// List keeps its narrower signature because it is what mcp.Backend requires;
+// widening it there would push a parameter no tool uses through every
+// implementation of that interface.
+func (c *Client) ListSelected(ctx context.Context, kind object.Kind, selector string) ([]api.ObjectView, error) {
+	path := api.Prefix + "/" + kind.Plural()
+	if selector != "" {
+		path += "?labelSelector=" + url.QueryEscape(selector)
+	}
 	var out api.ListResponse
-	if err := c.do(ctx, http.MethodGet, api.Prefix+"/"+kind.Plural(), nil, nil, &out); err != nil {
+	if err := c.do(ctx, http.MethodGet, path, nil, nil, &out); err != nil {
 		return nil, err
 	}
 	return out.Items, nil
+}
+
+// DocWrite writes one document into a store on the engine.
+func (c *Client) DocWrite(ctx context.Context, store string, req api.DocWriteRequest) (*api.DocWriteResponse, error) {
+	body, err := json.Marshal(req)
+	if err != nil {
+		return nil, err
+	}
+	var out api.DocWriteResponse
+	if err := c.do(ctx, http.MethodPost, api.Prefix+"/documentstores/"+store+"/write", body, nil, &out); err != nil {
+		return nil, err
+	}
+	return &out, nil
+}
+
+// Hotspots asks the engine what agents actually read.
+func (c *Client) Hotspots(ctx context.Context) (*api.HotspotsResponse, error) {
+	var out api.HotspotsResponse
+	if err := c.do(ctx, http.MethodGet, api.Prefix+"/hotspots", nil, nil, &out); err != nil {
+		return nil, err
+	}
+	return &out, nil
+}
+
+// Review returns what a repository declared about itself.
+func (c *Client) Review(ctx context.Context, name string) (*api.ReviewResponse, error) {
+	var out api.ReviewResponse
+	if err := c.do(ctx, http.MethodGet, api.Prefix+"/repositories/"+name+"/review", nil, nil, &out); err != nil {
+		return nil, err
+	}
+	return &out, nil
 }
 
 // Sync forces a refresh of one repository.

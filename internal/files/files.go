@@ -83,19 +83,163 @@ var skipDirs = map[string]bool{
 	".cache":        true,
 }
 
-// Root is the directory holding every checkout.
+// Root is the jail the file tools work inside.
+//
+// It has one default root -- the checkouts -- and any number of named extra
+// roots that appear as top-level directories beside the repositories. A path
+// whose first segment names an extra root resolves inside it; every other
+// path resolves inside the checkouts exactly as it always has, so "api/src/
+// main.go" means what it has always meant.
+//
+// One jail, several roots, not several jails: both containment checks run
+// against whichever root was selected, and Resolve stays the single entry
+// point the git and lsp layers already go through.
 type Root struct {
-	Dir string
+	Dir string // the checkouts, and the default for a bare path
+
+	// Extra maps a path prefix to the directory it stands for. A key is one
+	// or two segments: "mirrors" is a root, and "documents/product" is a
+	// document store that was pointed somewhere else on disk. The longest
+	// matching prefix wins, so a store with its own path shadows the default
+	// location without either of them knowing about the other.
+	Extra map[string]string
+
+	// Writable names the prefixes a write tool may reach. Nothing else in
+	// drover writes through this jail, and the default -- an empty set --
+	// is what keeps every root read-only unless something says otherwise.
+	Writable map[string]bool
 }
 
-// New returns a Root over the data directory's repos folder.
+// ExtraRootNames are the top-level names reserved for extra roots. They are
+// refused as object names (see object.ValidateName) so a repository can never
+// shadow one.
 //
-// The root is canonicalised once here. Containment is checked against the
+// "logs" is reserved before it is used. Reserving a name costs nothing;
+// discovering the collision after someone has a repository called logs costs
+// a migration.
+var ExtraRootNames = []string{"mirrors", "docs", "documents", "logs"}
+
+// New returns a Root over the data directory.
+//
+// Every root is canonicalised once here. Containment is checked against the
 // resolved form, and on macOS the data directory frequently sits under /var,
 // which is itself a symlink to /private/var -- comparing a resolved path
 // against an unresolved root would then reject every legitimate file.
 func New(dataDir string) *Root {
-	return &Root{Dir: canonicalDir(filepath.Join(dataDir, "repos"))}
+	extra := make(map[string]string, len(ExtraRootNames))
+	for _, name := range ExtraRootNames {
+		extra[name] = canonicalDir(filepath.Join(dataDir, name))
+	}
+	return &Root{Dir: canonicalDir(filepath.Join(dataDir, "repos")), Extra: extra}
+}
+
+// rootFor selects the root a caller-supplied path belongs to and returns the
+// path relative to it.
+//
+// An extra root is only selected when its directory exists. Until something
+// has written into mirrors/, "mirrors/api" is an ordinary miss inside the
+// checkouts rather than a confusing error about an empty root.
+func (r *Root) rootFor(rel string) (dir, rest string) {
+	key, rest := r.prefixFor(rel)
+	if key == "" {
+		return r.Dir, strings.TrimPrefix(filepath.ToSlash(rel), "/")
+	}
+	return r.Extra[key], rest
+}
+
+// maxRootSegments bounds the prefix search. A root is one segment; a document
+// store pointed at its own directory is two. Nothing needs three.
+const maxRootSegments = 2
+
+// prefixFor returns the longest Extra key this path starts with, and the rest
+// of the path relative to it. An empty key means the checkouts.
+func (r *Root) prefixFor(rel string) (key, rest string) {
+	clean := strings.TrimPrefix(filepath.ToSlash(rel), "/")
+	segs := strings.Split(clean, "/")
+	n := len(segs)
+	if n > maxRootSegments {
+		n = maxRootSegments
+	}
+	for ; n >= 1; n-- {
+		candidate := strings.Join(segs[:n], "/")
+		if dir, ok := r.Extra[candidate]; ok && isDir(dir) {
+			return candidate, strings.Join(segs[n:], "/")
+		}
+	}
+	return "", clean
+}
+
+// Writes reports whether a write tool may reach this path, and where it lands.
+//
+// A path is writable only when it sits inside a prefix that was explicitly
+// declared writable. The checkouts never are: they are mirrors that sync
+// resets to the remote, so a write there is data loss on a timer.
+func (r *Root) Writes(rel string) (string, error) {
+	key, _ := r.prefixFor(rel)
+	if key == "" || !r.Writable[key] {
+		return "", fmt.Errorf("%s is not writable; only a document store is", orRoot(rel))
+	}
+	return r.resolve(rel)
+}
+
+// activeExtras returns the top-level roots that exist, in a stable order.
+func (r *Root) activeExtras() []string {
+	var out []string
+	for _, name := range ExtraRootNames {
+		if dir, ok := r.Extra[name]; ok && isDir(dir) {
+			out = append(out, name)
+		}
+	}
+	return out
+}
+
+// childRoots returns the Extra prefixes that sit directly inside base.
+//
+// A document store with its own spec.path is not a subdirectory of
+// documents/, so listing documents/ would not find it. This is what puts it
+// back in the listing.
+func (r *Root) childRoots(base string) []string {
+	base = strings.Trim(filepath.ToSlash(base), "/")
+	if base == "" {
+		return nil
+	}
+	var out []string
+	for key, dir := range r.Extra {
+		parent, child, ok := strings.Cut(key, "/")
+		if !ok || parent != base || child == "" || !isDir(dir) {
+			continue
+		}
+		out = append(out, child)
+	}
+	sort.Strings(out)
+	return out
+}
+
+// SetRoot registers or moves a named prefix, and says whether it is writable.
+func (r *Root) SetRoot(key, dir string, writable bool) {
+	if r.Extra == nil {
+		r.Extra = map[string]string{}
+	}
+	if r.Writable == nil {
+		r.Writable = map[string]bool{}
+	}
+	r.Extra[key] = canonicalDir(dir)
+	if writable {
+		r.Writable[key] = true
+	} else {
+		delete(r.Writable, key)
+	}
+}
+
+// DropRoot forgets a named prefix.
+func (r *Root) DropRoot(key string) {
+	delete(r.Extra, key)
+	delete(r.Writable, key)
+}
+
+func isDir(path string) bool {
+	info, err := os.Stat(path)
+	return err == nil && info.IsDir()
 }
 
 // canonicalDir resolves a path even when it does not exist yet, by resolving
@@ -139,10 +283,11 @@ func (r *Root) resolve(rel string) (string, error) {
 			return "", fmt.Errorf("%w: %q walks upwards", ErrOutsideRoot, rel)
 		}
 	}
-	clean := filepath.Clean("/" + strings.TrimPrefix(rel, "/"))
-	abs := filepath.Join(r.Dir, clean)
+	dir, rest := r.rootFor(rel)
+	clean := filepath.Clean("/" + strings.TrimPrefix(rest, "/"))
+	abs := filepath.Join(dir, clean)
 
-	if !within(abs, r.Dir) {
+	if !within(abs, dir) {
 		return "", ErrOutsideRoot
 	}
 
@@ -152,14 +297,14 @@ func (r *Root) resolve(rel string) (string, error) {
 		// report that, but make sure its parent is still inside the root.
 		if os.IsNotExist(err) {
 			parent, err := filepath.EvalSymlinks(filepath.Dir(abs))
-			if err != nil || within(parent, r.Dir) {
+			if err != nil || within(parent, dir) {
 				return abs, nil
 			}
 			return "", ErrOutsideRoot
 		}
 		return "", err
 	}
-	if !within(resolved, r.Dir) {
+	if !within(resolved, dir) {
 		return "", fmt.Errorf("%w: %s is a link pointing out of the checkouts", ErrOutsideRoot, rel)
 	}
 	return resolved, nil
@@ -192,6 +337,40 @@ func (r *Root) resolveDir(rel string) (string, error) {
 	return abs, nil
 }
 
+// searchBases turns a search scope into the directories a walk starts from.
+//
+// A path names one subtree. A name list -- what a label selector resolved to
+// -- names several checkouts. They do not compose: a selector already answers
+// "which checkouts", so a path alongside it is either redundant or a
+// contradiction, and guessing which would be worse than refusing.
+func (r *Root) searchBases(path string, only []string) ([]string, error) {
+	if strings.TrimSpace(path) != "" && len(only) > 0 {
+		return nil, errors.New("give a path or a selector, not both: a selector already says which checkouts to search")
+	}
+	if len(only) == 0 {
+		base, err := r.resolveDir(path)
+		if err != nil {
+			return nil, err
+		}
+		return []string{base}, nil
+	}
+	var bases, missing []string
+	for _, name := range only {
+		base, err := r.resolveDir(name)
+		if err != nil {
+			// A labelled object whose checkout has not landed yet. Worth
+			// naming, but not worth failing the whole search over.
+			missing = append(missing, name)
+			continue
+		}
+		bases = append(bases, base)
+	}
+	if len(bases) == 0 {
+		return nil, fmt.Errorf("the selector matched %s, and none of them has a checkout yet", strings.Join(missing, ", "))
+	}
+	return bases, nil
+}
+
 func orRoot(rel string) string {
 	if strings.TrimSpace(rel) == "" {
 		return "the repository root"
@@ -208,13 +387,43 @@ func within(path, dir string) bool {
 	return rel == "." || (!strings.HasPrefix(rel, "..") && !filepath.IsAbs(rel))
 }
 
-// display turns an absolute path back into the repo-relative form callers use.
+// display turns an absolute path back into the form callers use: relative to
+// the checkouts, or prefixed with the extra root it sits in.
 func (r *Root) display(abs string) string {
-	rel, err := filepath.Rel(r.Dir, abs)
-	if err != nil {
-		return abs
+	// Longest key first, so a store with its own directory is displayed under
+	// its own prefix rather than under the root it nominally sits in.
+	keys := make([]string, 0, len(r.Extra))
+	for k := range r.Extra {
+		keys = append(keys, k)
 	}
-	return filepath.ToSlash(rel)
+	sort.Slice(keys, func(i, j int) bool {
+		ci, cj := strings.Count(keys[i], "/"), strings.Count(keys[j], "/")
+		if ci != cj {
+			return ci > cj
+		}
+		return keys[i] < keys[j]
+	})
+	for _, key := range keys {
+		if rel, ok := relativeTo(r.Extra[key], abs); ok {
+			if rel == "." {
+				return key
+			}
+			return key + "/" + rel
+		}
+	}
+	if rel, ok := relativeTo(r.Dir, abs); ok {
+		return rel
+	}
+	return abs
+}
+
+// relativeTo reports abs relative to dir, and whether abs is inside it.
+func relativeTo(dir, abs string) (string, bool) {
+	rel, err := filepath.Rel(dir, abs)
+	if err != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+		return "", false
+	}
+	return filepath.ToSlash(rel), true
 }
 
 // --- ls ---
@@ -226,6 +435,11 @@ type Entry struct {
 	Type  string `json:"type"` // file, dir, symlink
 	Size  int64  `json:"size,omitempty"`
 	Lines int    `json:"-"`
+
+	// Root marks an extra root rather than a checkout, so a renderer can say
+	// which of the top-level entries is a repository and which is a store of
+	// something else.
+	Root bool `json:"root,omitempty"`
 }
 
 // ListResult is what ls returns.
@@ -283,6 +497,31 @@ func (r *Root) List(rel string) (*ListResult, error) {
 			}
 		}
 		out.Entries = append(out.Entries, entry)
+	}
+
+	// Listing the top level lists the extra roots alongside the checkouts.
+	// This is how an agent discovers that mirrors/ exists at all -- the same
+	// way it discovers a repository, by listing nothing in particular.
+	if out.Path == "" && abs == r.Dir {
+		for _, name := range r.activeExtras() {
+			out.Entries = append(out.Entries, Entry{Name: name, Path: name, Type: "dir", Root: true})
+		}
+	}
+	// A child root is usually also a real subdirectory -- a document store
+	// with no spec.path sits exactly where the listing already found it. Mark
+	// the entry that is there rather than adding a second one, or every store
+	// in the default location is listed twice.
+	for _, name := range r.childRoots(out.Path) {
+		found := false
+		for i := range out.Entries {
+			if out.Entries[i].Name == name {
+				out.Entries[i].Root, found = true, true
+				break
+			}
+		}
+		if !found {
+			out.Entries = append(out.Entries, Entry{Name: name, Path: out.Path + "/" + name, Type: "dir", Root: true})
+		}
 	}
 
 	sort.Slice(out.Entries, func(i, j int) bool {
@@ -469,6 +708,12 @@ type GrepResult struct {
 	Matches   []Match `json:"matches"`
 	Files     int     `json:"filesSearched"`
 	Truncated bool    `json:"truncated,omitempty"`
+
+	// Unsearched names the extra roots a bare search did not walk. A search
+	// for a function name should not come back half pull-request comments,
+	// so the default scope is the checkouts -- but staying silent about it
+	// would make "no matches" mean two different things.
+	Unsearched []string `json:"unsearched,omitempty"`
 }
 
 // GrepOptions narrow a search.
@@ -477,6 +722,10 @@ type GrepOptions struct {
 	Include       string // glob on the file name, e.g. *.go
 	CaseSensitive bool
 	MaxResults    int
+
+	// Only restricts the search to these top-level names -- the checkouts a
+	// label selector resolved to. Empty means the whole default root.
+	Only []string
 }
 
 // Grep searches file contents for a regular expression.
@@ -503,7 +752,7 @@ func (r *Root) Grep(ctx context.Context, pattern string, opts GrepOptions) (*Gre
 		return nil, fmt.Errorf("pattern is not a valid regular expression: %w", err)
 	}
 
-	base, err := r.resolveDir(opts.Path)
+	bases, err := r.searchBases(opts.Path, opts.Only)
 	if err != nil {
 		return nil, err
 	}
@@ -517,7 +766,7 @@ func (r *Root) Grep(ctx context.Context, pattern string, opts GrepOptions) (*Gre
 	// that is what gets spread across cores.
 	var paths []string
 	var globErr error
-	err = r.walk(ctx, base, func(abs string, d os.DirEntry) error {
+	err = r.walkAll(ctx, bases, func(abs string, d os.DirEntry) error {
 		if opts.Include != "" {
 			ok, err := filepath.Match(opts.Include, d.Name())
 			if err != nil {
@@ -546,7 +795,7 @@ func (r *Root) Grep(ctx context.Context, pattern string, opts GrepOptions) (*Gre
 		return matches[i].Line < matches[j].Line
 	})
 
-	out := &GrepResult{Matches: matches, Files: len(paths)}
+	out := &GrepResult{Matches: matches, Files: len(paths), Unsearched: r.unsearched(opts.Path, opts.Only)}
 	if out.Matches == nil {
 		out.Matches = []Match{}
 	}
@@ -555,6 +804,18 @@ func (r *Root) Grep(ctx context.Context, pattern string, opts GrepOptions) (*Gre
 		out.Truncated = true
 	}
 	return out, nil
+}
+
+// unsearched names the extra roots a search with no path did not walk.
+//
+// A search that named a path searched exactly what it was pointed at, so
+// there is nothing to disclose; a bare search deliberately stayed in the
+// checkouts, and that is worth saying out loud.
+func (r *Root) unsearched(path string, only []string) []string {
+	if strings.TrimSpace(path) != "" || len(only) > 0 {
+		return nil
+	}
+	return r.activeExtras()
 }
 
 // wholeFileProbe builds the regexp used to reject a file in one pass, before
@@ -647,6 +908,23 @@ func (r *Root) grepFile(abs string, re, probe *regexp.Regexp, buf *[]byte, out [
 	if err != nil {
 		return out
 	}
+
+	// Sniff before reading. A binary file is rejected after one 8KB read
+	// rather than after the whole thing is in memory -- on one measured
+	// checkout, 96% of the bytes a search touched were binaries it then threw
+	// away, and the largest single file was a 214MB .exe.
+	head := make([]byte, binarySniff)
+	n, err := io.ReadFull(f, head)
+	if err != nil && !errors.Is(err, io.ErrUnexpectedEOF) && !errors.Is(err, io.EOF) {
+		return out
+	}
+	if isBinary(head[:n]) {
+		return out
+	}
+	if _, err := f.Seek(0, io.SeekStart); err != nil {
+		return out
+	}
+
 	if info.Size() > maxGrepFileBytes {
 		return r.grepStream(abs, f, re, out)
 	}
@@ -655,7 +933,7 @@ func (r *Root) grepFile(abs string, re, probe *regexp.Regexp, buf *[]byte, out [
 		*buf = make([]byte, info.Size())
 	}
 	data := (*buf)[:info.Size()]
-	n, err := io.ReadFull(f, data)
+	n, err = io.ReadFull(f, data)
 	if err != nil && !errors.Is(err, io.ErrUnexpectedEOF) && !errors.Is(err, io.EOF) {
 		return out
 	}
@@ -664,9 +942,6 @@ func (r *Root) grepFile(abs string, re, probe *regexp.Regexp, buf *[]byte, out [
 		*buf = nil
 	}
 
-	if isBinary(data) {
-		return out
-	}
 	// One pass to reject the whole file. Most files in a checkout contain the
 	// pattern nowhere, and this is far cheaper than running the matcher once
 	// per line to learn that.
@@ -741,12 +1016,24 @@ func isBinary(data []byte) bool {
 type FindResult struct {
 	Paths     []string `json:"paths"`
 	Truncated bool     `json:"truncated,omitempty"`
+
+	// Unsearched names the extra roots a bare search did not walk, for the
+	// same reason GrepResult carries it.
+	Unsearched []string `json:"unsearched,omitempty"`
+}
+
+// FindOptions narrow a find, and mirror GrepOptions so the two tools scope
+// the same way.
+type FindOptions struct {
+	Path       string
+	MaxResults int
+	Only       []string
 }
 
 // Find matches paths by glob. A pattern with no slash matches the file name;
 // one with a slash matches the whole repo-relative path, so both `*.go` and
 // `api/internal/*.go` do what they look like.
-func (r *Root) Find(ctx context.Context, pattern, path string, maxResults int) (*FindResult, error) {
+func (r *Root) Find(ctx context.Context, pattern string, opts FindOptions) (*FindResult, error) {
 	if strings.TrimSpace(pattern) == "" {
 		return nil, errors.New("the pattern is empty")
 	}
@@ -754,18 +1041,18 @@ func (r *Root) Find(ctx context.Context, pattern, path string, maxResults int) (
 		return nil, fmt.Errorf("pattern %q is not a valid glob: %w", pattern, err)
 	}
 
-	base, err := r.resolveDir(path)
+	bases, err := r.searchBases(opts.Path, opts.Only)
 	if err != nil {
 		return nil, err
 	}
-	max := maxResults
+	max := opts.MaxResults
 	if max <= 0 || max > MaxFindResults {
 		max = MaxFindResults
 	}
 	matchWholePath := strings.Contains(pattern, "/")
 
 	out := &FindResult{Paths: []string{}}
-	err = r.walk(ctx, base, func(abs string, d os.DirEntry) error {
+	err = r.walkAll(ctx, bases, func(abs string, d os.DirEntry) error {
 		subject := d.Name()
 		if matchWholePath {
 			subject = r.display(abs)
@@ -787,12 +1074,24 @@ func (r *Root) Find(ctx context.Context, pattern, path string, maxResults int) (
 		out.Truncated = true
 	}
 	sort.Strings(out.Paths)
+	out.Unsearched = r.unsearched(opts.Path, opts.Only)
 	return out, nil
 }
 
 // --- walking ---
 
 var errStop = errors.New("enough")
+
+// walkAll walks several bases in order, stopping the whole sweep as soon as
+// one of them says it has had enough.
+func (r *Root) walkAll(ctx context.Context, bases []string, fn func(abs string, d os.DirEntry) error) error {
+	for _, base := range bases {
+		if err := r.walk(ctx, base, fn); err != nil {
+			return err
+		}
+	}
+	return nil
+}
 
 // walk visits every regular file under base, skipping dependency and build
 // directories and never following a symlink out of the root.

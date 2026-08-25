@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"strings"
 
+	"github.com/notshekhar/drover/internal/activity"
 	"github.com/notshekhar/drover/internal/api"
 	"github.com/notshekhar/drover/internal/files"
 	"github.com/notshekhar/drover/internal/git"
@@ -66,7 +67,7 @@ func (b *backend) Ls(_ context.Context, req api.LsRequest) (*api.LsResponse, err
 	}
 	out := &api.LsResponse{Path: res.Path, Entries: []api.FileEntry{}, Truncated: res.Truncated}
 	for _, e := range res.Entries {
-		out.Entries = append(out.Entries, api.FileEntry{Name: e.Name, Path: e.Path, Type: e.Type, Size: e.Size})
+		out.Entries = append(out.Entries, api.FileEntry{Name: e.Name, Path: e.Path, Type: e.Type, Size: e.Size, Root: e.Root})
 	}
 	return out, nil
 }
@@ -87,16 +88,21 @@ func (b *backend) ReadFile(_ context.Context, req api.ReadRequest) (*api.ReadRes
 }
 
 func (b *backend) Grep(ctx context.Context, req api.GrepRequest) (*api.GrepResponse, error) {
+	only, err := b.selected(req.Selector)
+	if err != nil {
+		return nil, err
+	}
 	res, err := b.s.files.Grep(ctx, req.Pattern, files.GrepOptions{
 		Path:          req.Path,
 		Include:       req.Include,
 		CaseSensitive: req.CaseSensitive,
 		MaxResults:    req.MaxResults,
+		Only:          only,
 	})
 	if err != nil {
 		return nil, err
 	}
-	out := &api.GrepResponse{Matches: []api.GrepMatch{}, Files: res.Files, Truncated: res.Truncated}
+	out := &api.GrepResponse{Matches: []api.GrepMatch{}, Files: res.Files, Truncated: res.Truncated, Unsearched: res.Unsearched}
 	for _, m := range res.Matches {
 		out.Matches = append(out.Matches, api.GrepMatch{Path: m.Path, Line: m.Line, Text: m.Text})
 	}
@@ -104,11 +110,83 @@ func (b *backend) Grep(ctx context.Context, req api.GrepRequest) (*api.GrepRespo
 }
 
 func (b *backend) Find(ctx context.Context, req api.FindRequest) (*api.FindResponse, error) {
-	res, err := b.s.files.Find(ctx, req.Pattern, req.Path, req.MaxResults)
+	only, err := b.selected(req.Selector)
 	if err != nil {
 		return nil, err
 	}
-	return &api.FindResponse{Paths: res.Paths, Truncated: res.Truncated}, nil
+	res, err := b.s.files.Find(ctx, req.Pattern, files.FindOptions{Path: req.Path, MaxResults: req.MaxResults, Only: only})
+	if err != nil {
+		return nil, err
+	}
+	return &api.FindResponse{Paths: res.Paths, Truncated: res.Truncated, Unsearched: res.Unsearched}, nil
+}
+
+// selected resolves a label selector to the repository names it matches.
+//
+// An empty selector resolves to no names at all rather than to every name,
+// because "no restriction" and "restricted to everything" have to stay
+// distinguishable -- the first searches the root, the second would search a
+// list that happens to be complete today.
+//
+// A selector that matches nothing is an error, not an empty result. Silently
+// searching zero files and reporting no matches is the most misleading answer
+// a search tool can give.
+func (b *backend) selected(expr string) ([]string, error) {
+	sel, err := object.ParseSelector(expr)
+	if err != nil {
+		return nil, err
+	}
+	if len(sel) == 0 {
+		return nil, nil
+	}
+	objs, err := b.s.store.List(object.KindRepository)
+	if err != nil {
+		return nil, err
+	}
+	var names []string
+	for _, o := range objs {
+		if sel.Matches(o.Metadata.Labels) {
+			names = append(names, o.Metadata.Name)
+		}
+	}
+	if len(names) == 0 {
+		return nil, fmt.Errorf("no repository matches the selector %q; `drover get repository` lists what is here, with its labels", sel)
+	}
+	return names, nil
+}
+
+// DocWrite is the only write path an agent can reach.
+//
+// The author on the commit is the attribution the ledger already resolves, so
+// "who wrote this" is answerable with the git tool that already exists rather
+// than with a second audit mechanism.
+func (b *backend) DocWrite(ctx context.Context, store string, req api.DocWriteRequest) (*api.DocWriteResponse, error) {
+	return b.s.writeDocument(ctx, store, req, describeCaller(activity.CallerFrom(ctx)))
+}
+
+// describeCaller renders attribution the way a commit author reads.
+func describeCaller(c activity.Caller) string {
+	client := c.Client
+	if client == "" {
+		client = "an agent"
+	}
+	if c.Source == "" {
+		return client
+	}
+	return client + " via " + c.Source
+}
+
+// Hotspots is the behavioural index: what agents actually read here.
+func (b *backend) Hotspots(ctx context.Context) (*api.HotspotsResponse, error) {
+	out := &api.HotspotsResponse{}
+	spots, err := b.s.ledger.Hotspots(ctx, hotspotWindow, 5)
+	if err != nil {
+		return nil, err
+	}
+	for _, h := range spots {
+		out.Hotspots = append(out.Hotspots, api.Hotspot{Repository: h.Repository, Path: h.Path, Reads: h.Reads})
+	}
+	return out, nil
 }
 
 func (b *backend) Call(ctx context.Context, name string, req api.CallRequest) (*api.CallResponse, error) {

@@ -255,7 +255,7 @@ func TestGrepTruncates(t *testing.T) {
 
 func TestFindByName(t *testing.T) {
 	r := tree(t)
-	res, err := r.Find(context.Background(), "*.go", "", 0)
+	res, err := r.Find(context.Background(), "*.go", FindOptions{Path: "", MaxResults: 0})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -274,7 +274,7 @@ func TestFindByName(t *testing.T) {
 // do what they look like.
 func TestFindByPath(t *testing.T) {
 	r := tree(t)
-	res, err := r.Find(context.Background(), "api/internal/*.go", "", 0)
+	res, err := r.Find(context.Background(), "api/internal/*.go", FindOptions{Path: "", MaxResults: 0})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -285,7 +285,7 @@ func TestFindByPath(t *testing.T) {
 
 func TestFindSkipsGit(t *testing.T) {
 	r := tree(t)
-	res, err := r.Find(context.Background(), "config", "", 0)
+	res, err := r.Find(context.Background(), "config", FindOptions{Path: "", MaxResults: 0})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -316,7 +316,7 @@ func TestPathTraversalIsRefused(t *testing.T) {
 		if _, err := r.Grep(context.Background(), "x", GrepOptions{Path: bad}); err == nil {
 			t.Errorf("Grep(path=%q) was allowed", bad)
 		}
-		if _, err := r.Find(context.Background(), "*", bad, 0); err == nil {
+		if _, err := r.Find(context.Background(), "*", FindOptions{Path: bad, MaxResults: 0}); err == nil {
 			t.Errorf("Find(path=%q) was allowed", bad)
 		}
 	}

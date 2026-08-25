@@ -6,6 +6,7 @@ import (
 	"flag"
 	"fmt"
 	"os"
+	"sort"
 	"strings"
 	"text/tabwriter"
 
@@ -43,8 +44,9 @@ func cmdGet(ctx context.Context, args []string) error {
 		configFlag  = fs.String("config", "", "")
 		serverFlag  = fs.String("server", "", "")
 		outFlag     = fs.String("o", "table", "output format: table, yaml or json")
+		labelFlag   = fs.String("l", "", "label selector, e.g. team=billing")
 	)
-	flags, rest := splitArgs(args, clientFlags("o"))
+	flags, rest := splitArgs(args, clientFlags("o", "l"))
 	if err := fs.Parse(flags); err != nil {
 		return err
 	}
@@ -62,6 +64,9 @@ func cmdGet(ctx context.Context, args []string) error {
 	}
 
 	if len(rest) > 1 {
+		if *labelFlag != "" {
+			return fmt.Errorf("a name and a selector together: `drover get %s %s` already names one object", rest[0], rest[1])
+		}
 		v, err := c.Get(ctx, kind, rest[1])
 		if err != nil {
 			return err
@@ -69,9 +74,13 @@ func cmdGet(ctx context.Context, args []string) error {
 		return printViews([]api.ObjectView{*v}, *outFlag, kind)
 	}
 
-	items, err := c.List(ctx, kind)
+	items, err := c.ListSelected(ctx, kind, *labelFlag)
 	if err != nil {
 		return err
+	}
+	if len(items) == 0 && *labelFlag != "" {
+		fmt.Fprintf(os.Stderr, "no %s objects match %s\n", kind, *labelFlag)
+		return nil
 	}
 	return printViews(items, *outFlag, kind)
 }
@@ -109,10 +118,13 @@ func printTable(items []api.ObjectView, kind object.Kind) error {
 
 	switch kind {
 	case object.KindRepository:
-		fmt.Fprintln(w, "NAME\tURL\tBRANCH\tREFRESH\tSTATUS\tCOMMIT")
+		// LABELS earns its column: a selector is unusable until you can see
+		// what there is to select on.
+		fmt.Fprintln(w, "NAME\tURL\tBRANCH\tREFRESH\tSTATUS\tCOMMIT\tLABELS\tMIRROR")
 		for _, v := range items {
-			fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\t%s\n",
-				v.Name, v.URL, v.Branch, dash(v.RefreshInterval), status(v), dash(shortCommit(v.Commit)))
+			fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n",
+				v.Name, v.URL, v.Branch, dash(v.RefreshInterval), status(v), dash(shortCommit(v.Commit)),
+				dash(formatLabels(v.Labels)), dash(mirrorCell(v)))
 		}
 
 	case object.KindEnvironment:
@@ -134,9 +146,18 @@ func printTable(items []api.ObjectView, kind object.Kind) error {
 		}
 
 	case object.KindSQLConnection:
-		fmt.Fprintln(w, "NAME\tPROVIDER\tACCESS\tMAXROWS\tSTATUS")
+		fmt.Fprintln(w, "NAME\tPROVIDER\tACCESS\tMAXROWS\tSTATUS\tSCHEMA")
 		for _, v := range items {
-			fmt.Fprintf(w, "%s\t%s\t%s\t%d\t%s\n", v.Name, dash(v.Provider), access(v.ReadOnly), v.MaxRows, status(v))
+			fmt.Fprintf(w, "%s\t%s\t%s\t%d\t%s\t%s\n", v.Name, dash(v.Provider), access(v.ReadOnly), v.MaxRows, status(v), dash(schemaCell(v)))
+		}
+
+	case object.KindDocumentStore:
+		// The path is the column that matters: it is what an agent passes to
+		// read, grep and doc_write, and it is not the name.
+		fmt.Fprintln(w, "NAME\tPATH\tACCESS\tDOCUMENTS\tDESCRIPTION")
+		for _, v := range items {
+			fmt.Fprintf(w, "%s\t%s\t%s\t%d\t%s\n",
+				v.Name, dash(v.URL), storeAccess(v.Writable), v.Documents, dash(v.Description))
 		}
 
 	default:
@@ -357,4 +378,56 @@ func cmdForget(ctx context.Context, args []string) error {
 	}
 	fmt.Printf("dropped %s from %s\n", rest[0], cfgPath)
 	return nil
+}
+
+// formatLabels renders a label set for a table cell, in a stable order.
+func formatLabels(labels map[string]string) string {
+	if len(labels) == 0 {
+		return ""
+	}
+	keys := make([]string, 0, len(labels))
+	for k := range labels {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	parts := make([]string, 0, len(keys))
+	for _, k := range keys {
+		parts = append(parts, k+"="+labels[k])
+	}
+	return strings.Join(parts, ",")
+}
+
+// mirrorCell is the discussion mirror's one line, or the reason there is not
+// one. A mirror that failed says so here rather than in STATUS, because the
+// checkout is still fine and STATUS is about the checkout.
+func mirrorCell(v api.ObjectView) string {
+	if v.MirrorError != "" {
+		msg := v.MirrorError
+		if i := strings.IndexByte(msg, '\n'); i >= 0 {
+			msg = msg[:i]
+		}
+		return "failed: " + msg
+	}
+	return v.Mirror
+}
+
+// schemaCell is where the dumped shape landed, or why it did not.
+func schemaCell(v api.ObjectView) string {
+	if v.SchemaError != "" {
+		msg := v.SchemaError
+		if i := strings.IndexByte(msg, '\n'); i >= 0 {
+			msg = msg[:i]
+		}
+		return "failed: " + msg
+	}
+	return v.Schema
+}
+
+// storeAccess spells out what a store allows, in the same words the
+// SQLConnection table uses for the same idea.
+func storeAccess(writable bool) string {
+	if writable {
+		return "writable"
+	}
+	return "read-only"
 }

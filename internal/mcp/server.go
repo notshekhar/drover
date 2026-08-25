@@ -39,6 +39,15 @@ type Backend interface {
 
 	Call(ctx context.Context, name string, req api.CallRequest) (*api.CallResponse, error)
 	Query(ctx context.Context, name, query string) (*api.QueryResponse, error)
+
+	// DocWrite is the only write in drover. Stores are the one place an
+	// agent may leave something behind.
+	DocWrite(ctx context.Context, store string, req api.DocWriteRequest) (*api.DocWriteResponse, error)
+
+	// Hotspots is the behavioural index: which files agents have actually
+	// read here. It is on the interface rather than read from the ledger
+	// directly because the stdio bridge holds no ledger of its own.
+	Hotspots(ctx context.Context) (*api.HotspotsResponse, error)
 }
 
 // ProtocolVersion is the MCP revision drover implements.
@@ -163,13 +172,8 @@ func (s *Server) router() *router {
 	r.handle("resources/list", s.listResources)
 	r.handle("resources/read", s.readResource)
 
-	// Declared but empty, so a client that asks does not get a
-	// method-not-found it has to special-case. Prompts are user-invoked, which
-	// makes them a good home for a canned investigation later; there is
-	// nothing to put there yet.
-	r.handle("prompts/list", func(context.Context, json.RawMessage) (any, *rpcError) {
-		return map[string]any{"prompts": []any{}}, nil
-	})
+	r.handle("prompts/list", s.listPrompts)
+	r.handle("prompts/get", s.getPrompt)
 	return r
 }
 
@@ -285,6 +289,10 @@ func (s *Server) initialize(ctx context.Context, params json.RawMessage) (any, *
 			"tools": tools,
 			// resources: the list is fixed at two, so no listChanged here.
 			"resources": map[string]any{},
+			// prompts: generated from what the engine holds, so the list can
+			// change -- but a client re-lists on demand and drover has no
+			// reason to push, so no listChanged here either.
+			"prompts": map[string]any{},
 		},
 		"serverInfo": map[string]any{
 			"name":    "drover",
@@ -351,6 +359,7 @@ func (s *Server) listTools(ctx context.Context, _ json.RawMessage) (any, *rpcErr
 	tools = append(tools, s.lspTools(ctx)...)
 	tools = append(tools, s.apiTools(ctx)...)
 	tools = append(tools, s.sqlTools(ctx)...)
+	tools = append(tools, s.docTools(ctx)...)
 	return map[string]any{"tools": tools}, nil
 }
 
@@ -395,6 +404,7 @@ var fileTools = []Tool{
 				"include":       {Type: "string", Description: "Only search files whose name matches this glob, e.g. `*.go`."},
 				"caseSensitive": {Type: "boolean", Description: "Match case exactly. Defaults to false.", Default: false},
 				"maxResults":    {Type: "integer", Description: "Cap the number of matches returned."},
+				"selector":      {Type: "string", Description: "Search only the repositories whose labels match, e.g. `team=billing` or `tier!=frontend`. Comma-separated clauses are ANDed; a bare key means the label exists, `!key` that it does not. Use this instead of `path` when you know the domain but not the directory. The connection inventory lists each repository's labels."},
 			},
 		},
 	},
@@ -409,6 +419,7 @@ var fileTools = []Tool{
 				"pattern":    {Type: "string", Description: "Glob, e.g. `*_test.go` or `api/cmd/*`."},
 				"path":       {Type: "string", Description: "Limit the search to this subtree. Naming a skipped directory here searches it."},
 				"maxResults": {Type: "integer", Description: "Cap the number of paths returned."},
+				"selector":   {Type: "string", Description: "Search only the repositories whose labels match, e.g. `team=billing`. Same grammar as grep's selector."},
 			},
 		},
 	},
@@ -522,7 +533,7 @@ func (s *Server) sqlTools(ctx context.Context) []Tool {
 		Name: "sql_query",
 		Description: "Run a READ-ONLY SQL query against one of the configured databases and return the rows. " +
 			"Only SELECT / WITH / SHOW / EXPLAIN / DESCRIBE / VALUES / TABLE statements are allowed -- anything that writes is rejected, and so is sending two statements at once. " +
-			"Use information_schema (or the dialect's own catalog) to discover tables and columns before querying, and add a LIMIT to exploratory queries.\n\n" +
+			"Read `docs/schema/<connection>.sql` first -- drover dumps every table, column, foreign key and row-count estimate there, so discovering the shape costs a `read` and not a round trip. Fall back to information_schema only if that file is not there. Add a LIMIT to exploratory queries.\n\n" +
 			connectionCatalog(ready),
 		InputSchema: Schema{
 			Type:       "object",

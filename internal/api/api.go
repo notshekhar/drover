@@ -51,10 +51,11 @@ type ApplyResponse struct {
 
 // ObjectView is one object as the server reports it.
 type ObjectView struct {
-	Kind      string `json:"kind"`
-	Name      string `json:"name"`
-	Source    string `json:"source,omitempty"`
-	AppliedAt string `json:"appliedAt,omitempty"`
+	Kind      string            `json:"kind"`
+	Name      string            `json:"name"`
+	Source    string            `json:"source,omitempty"`
+	AppliedAt string            `json:"appliedAt,omitempty"`
+	Labels    map[string]string `json:"labels,omitempty"`
 
 	// YAML is the stored document, so `drover get -o yaml` can print exactly
 	// what the engine holds.
@@ -70,6 +71,25 @@ type ObjectView struct {
 	Error    string `json:"error,omitempty"`
 	Commit   string `json:"commit,omitempty"`
 	LastSync string `json:"lastSync,omitempty"`
+
+	// Mirror is what the discussion mirror last did, and MirrorError why it
+	// could not. They are separate from Status and Error because a mirror
+	// that cannot reach GitHub is not a checkout that failed.
+	Mirror      string `json:"mirror,omitempty"`
+	MirrorError string `json:"mirrorError,omitempty"`
+
+	// Schema is where a SQLConnection's dumped shape landed.
+	Schema      string `json:"schema,omitempty"`
+	SchemaError string `json:"schemaError,omitempty"`
+
+	// Config is what a repository's own .drover.yaml contributed.
+	Config      string `json:"config,omitempty"`
+	ConfigError string `json:"configError,omitempty"`
+
+	// DocumentStore fields, set when Kind is DocumentStore.
+	Description string `json:"description,omitempty"`
+	Writable    bool   `json:"writable,omitempty"`
+	Documents   int    `json:"documents,omitempty"`
 
 	// Environment fields.
 	Variables []string       `json:"variables,omitempty"`
@@ -152,6 +172,10 @@ type FileEntry struct {
 	Path string `json:"path"`
 	Type string `json:"type"`
 	Size int64  `json:"size,omitempty"`
+
+	// Root marks a top-level entry that is a store of something other than
+	// source -- mirrored issues, documents -- rather than a checkout.
+	Root bool `json:"root,omitempty"`
 }
 
 // LsResponse is a directory listing.
@@ -185,6 +209,11 @@ type GrepRequest struct {
 	Include       string `json:"include,omitempty"`
 	CaseSensitive bool   `json:"caseSensitive,omitempty"`
 	MaxResults    int    `json:"maxResults,omitempty"`
+
+	// Selector narrows the search to the repositories whose labels match,
+	// instead of to a path. On a warehouse of any size this is the difference
+	// between a search and a scan.
+	Selector string `json:"selector,omitempty"`
 }
 
 // GrepMatch is one hit.
@@ -199,6 +228,9 @@ type GrepResponse struct {
 	Matches   []GrepMatch `json:"matches"`
 	Files     int         `json:"filesSearched"`
 	Truncated bool        `json:"truncated,omitempty"`
+
+	// Unsearched names the roots a search with no path did not walk.
+	Unsearched []string `json:"unsearched,omitempty"`
 }
 
 // FindRequest matches paths by glob.
@@ -206,12 +238,71 @@ type FindRequest struct {
 	Pattern    string `json:"pattern"`
 	Path       string `json:"path,omitempty"`
 	MaxResults int    `json:"maxResults,omitempty"`
+	Selector   string `json:"selector,omitempty"`
 }
 
 // FindResponse is a set of paths.
 type FindResponse struct {
 	Paths     []string `json:"paths"`
 	Truncated bool     `json:"truncated,omitempty"`
+
+	// Unsearched names the roots a search with no path did not walk.
+	Unsearched []string `json:"unsearched,omitempty"`
+}
+
+// DocWriteRequest writes one document into a store.
+type DocWriteRequest struct {
+	Path    string `json:"path"`
+	Content string `json:"content"`
+	Reason  string `json:"reason,omitempty"`
+}
+
+// DocWriteResponse is what a write did.
+type DocWriteResponse struct {
+	Path      string `json:"path"`
+	Bytes     int    `json:"bytes"`
+	Created   bool   `json:"created"`
+	Commit    string `json:"commit,omitempty"`
+	Unchanged bool   `json:"unchanged,omitempty"`
+}
+
+// DocumentStoreView is one store, for a listing.
+type DocumentStoreView struct {
+	Name        string `json:"name"`
+	Description string `json:"description,omitempty"`
+	Path        string `json:"path"`
+	Writable    bool   `json:"writable"`
+	Documents   int    `json:"documents"`
+}
+
+// Hotspot is one path agents keep coming back to, and EmptySearch a pattern
+// they keep failing to find.
+type Hotspot struct {
+	Repository string `json:"repository"`
+	Path       string `json:"path"`
+	Reads      int    `json:"reads"`
+}
+
+// EmptySearch is a pattern searched for repeatedly with no result.
+type EmptySearch struct {
+	Pattern string `json:"pattern"`
+	Times   int    `json:"times"`
+}
+
+// HotspotsResponse is what the activity ledger knows about where agents go.
+type HotspotsResponse struct {
+	Hotspots []Hotspot     `json:"hotspots"`
+	Empty    []EmptySearch `json:"emptySearches,omitempty"`
+}
+
+// ReviewResponse is what a repository's own .drover.yaml declared, and
+// whether any of it was applied.
+type ReviewResponse struct {
+	Repository string `json:"repository"`
+	Trusted    bool   `json:"trusted"`
+	Documents  string `json:"documents,omitempty"`
+	Summary    string `json:"summary,omitempty"`
+	Error      string `json:"error,omitempty"`
 }
 
 // ReloadResponse reports what a reload did.
@@ -244,7 +335,26 @@ type DashRepo struct {
 	Status   string `json:"status"`
 	Commit   string `json:"commit,omitempty"`
 	LastSync string `json:"lastSync,omitempty"`
-	Error    string `json:"error,omitempty"`
+
+	// Mirror is what the discussion mirror last did, and MirrorError why it
+	// could not. They are separate from Status and Error because a mirror
+	// that cannot reach GitHub is not a checkout that failed.
+	Mirror      string `json:"mirror,omitempty"`
+	MirrorError string `json:"mirrorError,omitempty"`
+
+	// Schema is where a SQLConnection's dumped shape landed.
+	Schema      string `json:"schema,omitempty"`
+	SchemaError string `json:"schemaError,omitempty"`
+
+	// Config is what a repository's own .drover.yaml contributed.
+	Config      string `json:"config,omitempty"`
+	ConfigError string `json:"configError,omitempty"`
+
+	// DocumentStore fields, set when Kind is DocumentStore.
+	Description string `json:"description,omitempty"`
+	Writable    bool   `json:"writable,omitempty"`
+	Documents   int    `json:"documents,omitempty"`
+	Error       string `json:"error,omitempty"`
 }
 
 // DashRequest is one HTTPRequest row.

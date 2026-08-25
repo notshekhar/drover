@@ -22,13 +22,16 @@ import (
 
 	"github.com/notshekhar/drover/internal/activity"
 	"github.com/notshekhar/drover/internal/api"
+	"github.com/notshekhar/drover/internal/atomicfile"
 	"github.com/notshekhar/drover/internal/config"
 	"github.com/notshekhar/drover/internal/docs"
+	"github.com/notshekhar/drover/internal/docstore"
 	"github.com/notshekhar/drover/internal/files"
 	"github.com/notshekhar/drover/internal/git"
 	"github.com/notshekhar/drover/internal/httpreq"
 	"github.com/notshekhar/drover/internal/lsp"
 	"github.com/notshekhar/drover/internal/mcp"
+	"github.com/notshekhar/drover/internal/mirror"
 	"github.com/notshekhar/drover/internal/object"
 	"github.com/notshekhar/drover/internal/repo"
 	"github.com/notshekhar/drover/internal/sqldb"
@@ -79,6 +82,8 @@ type Server struct {
 	opts   Options
 	store  *store.Store
 	repo   *repo.Reconciler
+	docs   *docstore.Manager
+	mirror *mirror.Mirror
 	sync   *syncmgr.Manager
 	http   *httpreq.Executor
 	sql    *sqldb.Pool
@@ -126,6 +131,8 @@ func New(opts Options) (*Server, error) {
 		opts:                 opts,
 		store:                st,
 		repo:                 repo.New(opts.DataDir),
+		mirror:               mirror.New(opts.DataDir, nil),
+		docs:                 docstore.New(opts.DataDir),
 		http:                 httpreq.New(),
 		sql:                  sqldb.NewPool(),
 		files:                files.New(opts.DataDir),
@@ -149,10 +156,12 @@ func New(opts Options) (*Server, error) {
 
 	if !opts.NoSync {
 		s.sync = syncmgr.New(syncmgr.Options{
-			Store:   st,
-			Repo:    s.repo,
-			Default: opts.Sync,
-			Log:     opts.Log,
+			Store:        st,
+			Repo:         s.repo,
+			Mirror:       s.mirror,
+			SelfDescribe: &selfDescriber{s: s},
+			Default:      opts.Sync,
+			Log:          opts.Log,
 			// Reconcile resets the working tree, so a server that has already
 			// parsed it is now answering about a tree that no longer exists.
 			OnCommitChanged: s.restartLanguageServers,
@@ -227,6 +236,9 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("POST "+api.Prefix+"/files/read", s.handleRead)
 	s.mux.HandleFunc("POST "+api.Prefix+"/files/grep", s.handleGrep)
 	s.mux.HandleFunc("POST "+api.Prefix+"/files/find", s.handleFind)
+	s.mux.HandleFunc("GET "+api.Prefix+"/repositories/{name}/review", s.handleReview)
+	s.mux.HandleFunc("GET "+api.Prefix+"/hotspots", s.handleHotspots)
+	s.mux.HandleFunc("POST "+api.Prefix+"/documentstores/{name}/write", s.handleDocWrite)
 	s.mux.HandleFunc("POST "+api.Prefix+"/git", s.handleGit)
 	s.mux.HandleFunc("POST "+api.Prefix+"/lsp", s.handleLSP)
 	s.mux.HandleFunc("POST "+api.Prefix+"/httprequests/{name}/call", s.handleCall)
@@ -256,6 +268,10 @@ func (s *Server) Bootstrap(cfg *config.Config) error {
 		return fmt.Errorf("read stored objects: %w", err)
 	}
 	s.logf("loaded %d object(s) from %s", len(existing), s.store.Dir())
+
+	// Stores are registered before the listener opens: a store the file tools
+	// cannot see is a store an agent will never find.
+	s.registerStores()
 
 	// Write the reference before anything else, so a first run leaves a
 	// data directory that explains itself.
@@ -676,6 +692,8 @@ func (s *Server) objectChanged(o *object.Object) {
 		}
 	case object.KindSQLConnection:
 		s.sql.Forget(o.Metadata.Name)
+	case object.KindDocumentStore:
+		s.registerStore(o)
 	}
 }
 
@@ -732,6 +750,11 @@ func (s *Server) handleGet(w http.ResponseWriter, r *http.Request, kind object.K
 }
 
 func (s *Server) handleList(w http.ResponseWriter, r *http.Request, kind object.Kind) {
+	sel, err := object.ParseSelector(r.URL.Query().Get("labelSelector"))
+	if err != nil {
+		writeErr(w, http.StatusBadRequest, err)
+		return
+	}
 	objs, err := s.store.List(kind)
 	if err != nil {
 		writeErr(w, http.StatusInternalServerError, err)
@@ -739,13 +762,90 @@ func (s *Server) handleList(w http.ResponseWriter, r *http.Request, kind object.
 	}
 	resp := api.ListResponse{Items: []api.ObjectView{}}
 	for _, o := range objs {
+		if !sel.Matches(o.Metadata.Labels) {
+			continue
+		}
 		resp.Items = append(resp.Items, s.viewWithStatus(o))
 	}
 	writeJSON(w, http.StatusOK, resp)
 }
 
+// hotspotWindow is how far back the behavioural index looks. Long enough to
+// be stable across a working week, short enough that a repository somebody
+// stopped touching drops off it.
+const hotspotWindow = 14 * 24 * time.Hour
+
+// handleDocWrite is the one endpoint in drover that changes a file.
+func (s *Server) handleDocWrite(w http.ResponseWriter, r *http.Request) {
+	var req api.DocWriteRequest
+	if !decodeBody(w, r, &req) {
+		return
+	}
+	res, err := s.Backend().DocWrite(s.attrCtx(r), r.PathValue("name"), req)
+	if err != nil {
+		writeErr(w, http.StatusBadRequest, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, res)
+}
+
+// handleHotspots answers what the activity ledger knows about where agents go.
+func (s *Server) handleHotspots(w http.ResponseWriter, r *http.Request) {
+	out := api.HotspotsResponse{Hotspots: []api.Hotspot{}}
+	spots, err := s.ledger.Hotspots(r.Context(), hotspotWindow, 5)
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, err)
+		return
+	}
+	for _, h := range spots {
+		out.Hotspots = append(out.Hotspots, api.Hotspot{Repository: h.Repository, Path: h.Path, Reads: h.Reads})
+	}
+	if empty, err := s.ledger.EmptySearches(r.Context(), hotspotWindow, 5); err == nil {
+		for _, e := range empty {
+			out.Empty = append(out.Empty, api.EmptySearch{Pattern: e.Pattern, Times: e.Times})
+		}
+	}
+	writeJSON(w, http.StatusOK, out)
+}
+
+// handleReview returns what a repository declared about itself.
+//
+// It reads the quarantine file rather than the checkout, so what a person
+// reviews is exactly what drover parsed -- not the file as it is on disk now,
+// which may have moved on since.
+func (s *Server) handleReview(w http.ResponseWriter, r *http.Request) {
+	name := r.PathValue("name")
+	o, err := s.store.Get(object.KindRepository, name)
+	if err != nil {
+		writeErr(w, http.StatusNotFound, err)
+		return
+	}
+	spec, err := o.Repository()
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, err)
+		return
+	}
+
+	out := api.ReviewResponse{Repository: name, Trusted: spec.TrustConfig}
+	if st, err := s.store.GetStatus(object.KindRepository, name); err == nil && st != nil {
+		out.Summary, out.Error = st.Config, st.ConfigError
+	}
+	if data, err := os.ReadFile(filepath.Join(s.pendingDir(), name+".yaml")); err == nil {
+		out.Documents = string(data)
+	}
+	writeJSON(w, http.StatusOK, out)
+}
+
 func (s *Server) handleDelete(w http.ResponseWriter, r *http.Request, kind object.Kind) {
 	name := r.PathValue("name")
+	// Read before deleting: a document store's spec says where its content
+	// lives, and after the object is gone there is nothing left to ask.
+	var storeSpec *object.DocumentStoreSpec
+	if kind == object.KindDocumentStore {
+		if o, err := s.store.Get(kind, name); err == nil {
+			storeSpec, _ = o.DocumentStore()
+		}
+	}
 	err := s.store.Delete(kind, name)
 	if errors.Is(err, store.ErrNotFound) {
 		writeErr(w, http.StatusNotFound, err)
@@ -771,6 +871,24 @@ func (s *Server) handleDelete(w http.ResponseWriter, r *http.Request, kind objec
 			writeErr(w, http.StatusInternalServerError, fmt.Errorf("object deleted but its checkout remains at %s: %w", s.repo.Path(name), err))
 			return
 		}
+		// The mirror is the object's too. Leaving it behind would keep an
+		// agent grepping the discussion of a repository drover no longer has.
+		_ = os.Remove(filepath.Join(s.pendingDir(), name+".yaml"))
+		if err := s.mirror.Remove(name); err != nil {
+			writeErr(w, http.StatusInternalServerError, fmt.Errorf("object deleted but its mirror remains at %s: %w", s.mirror.Path(name), err))
+			return
+		}
+	}
+	if kind == object.KindDocumentStore && storeSpec != nil {
+		// The object goes; the content goes with it only when drover created
+		// the directory. A store pointed at somebody's own docs folder is
+		// theirs, and deleting the object should stop drover offering it,
+		// not destroy the documents.
+		if err := s.docs.Remove(name, storeSpec); err != nil {
+			writeErr(w, http.StatusInternalServerError, err)
+			return
+		}
+		s.files.DropRoot(docstore.PathPrefix(name))
 	}
 	if kind == object.KindSQLConnection {
 		// Closes the pool rather than leaving its connections open against a
@@ -1027,12 +1145,50 @@ func (s *Server) checkSQLHealth(ctx context.Context, name string, spec *object.S
 		_ = s.store.MarkFailed(object.KindSQLConnection, name, err)
 		return err
 	}
-	_ = s.store.SetStatus(object.KindSQLConnection, name, &store.Status{
-		Phase:       store.PhaseReady,
-		LastAttempt: time.Now().UTC().Format(time.RFC3339),
-		LastSuccess: time.Now().UTC().Format(time.RFC3339),
-	})
+	ts := time.Now().UTC().Format(time.RFC3339)
+	st := &store.Status{Phase: store.PhaseReady, LastAttempt: ts, LastSuccess: ts}
+	st.Schema, st.SchemaError = s.dumpSchema(ctx, name, spec)
+	_ = s.store.SetStatus(object.KindSQLConnection, name, st)
 	return nil
+}
+
+// schemaMaxAge is how stale a dump may be before the next health check
+// rewrites it. Catalog queries are slow on a large database and the shape
+// changes rarely, so this is deliberately not "every check".
+const schemaMaxAge = time.Hour
+
+// dumpSchema writes the database's shape to docs/schema/<name>.sql.
+//
+// It rides the health gate rather than getting a schedule of its own: health
+// already proves the credentials work, and a database that fails its gate is
+// one whose schema nobody is going to trust anyway.
+//
+// The summary and any failure are returned rather than stored here, so the
+// caller writes the status once instead of twice. A dump failure is reported
+// on its own line and never fails the health check -- the connection is still
+// queryable, it is just less convenient.
+func (s *Server) dumpSchema(ctx context.Context, name string, spec *object.SQLConnectionSpec) (summary, failure string) {
+	path := filepath.Join(s.opts.DataDir, "docs", "schema", name+".sql")
+	if info, err := os.Stat(path); err == nil && time.Since(info.ModTime()) < schemaMaxAge {
+		if prev, err := s.store.GetStatus(object.KindSQLConnection, name); err == nil && prev != nil {
+			return prev.Schema, prev.SchemaError
+		}
+	}
+
+	schema, err := s.sql.DumpSchema(ctx, name, spec)
+	if err != nil {
+		s.logf("sqlconnection %s: schema dump: %v", name, err)
+		return "", err.Error()
+	}
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		return "", err.Error()
+	}
+	if err := atomicfile.Write(path, schema.SQL(), 0o644); err != nil {
+		return "", err.Error()
+	}
+
+	tables := len(schema.Tables)
+	return fmt.Sprintf("%d tables at docs/schema/%s.sql", tables, name), ""
 }
 
 // viewWithStatus adds observed state, so `get repository` can answer whether
@@ -1044,6 +1200,20 @@ func (s *Server) viewWithStatus(o *object.Object) api.ObjectView {
 		v.Error = st.Error
 		v.Commit = st.Commit
 		v.LastSync = st.LastSuccess
+		v.Mirror = st.Mirror
+		v.MirrorError = st.MirrorError
+		v.Schema = st.Schema
+		v.SchemaError = st.SchemaError
+		v.Config = st.Config
+		v.ConfigError = st.ConfigError
+	}
+	// A store's document count is observed, not declared, so it belongs here
+	// rather than in view() -- which is a free function with no manager to
+	// ask.
+	if o.Kind == object.KindDocumentStore {
+		if spec, err := o.DocumentStore(); err == nil {
+			v.Documents = s.docs.Count(o.Metadata.Name, spec)
+		}
 	}
 	return v
 }
@@ -1055,6 +1225,7 @@ func view(o *object.Object) api.ObjectView {
 		Name:      o.Metadata.Name,
 		Source:    o.Metadata.Source,
 		AppliedAt: o.Metadata.AppliedAt,
+		Labels:    o.Metadata.Labels,
 	}
 	if data, err := yaml.Marshal(o); err == nil {
 		v.YAML = string(data)
@@ -1088,6 +1259,13 @@ func view(o *object.Object) api.ObjectView {
 			v.Safe = spec.IsSafe()
 			v.Params = spec.RequiredParams()
 		}
+
+	case object.KindDocumentStore:
+		if spec, err := o.DocumentStore(); err == nil {
+			v.Description = spec.Description
+			v.Writable = spec.IsWritable()
+		}
+		v.URL = docstore.PathPrefix(o.Metadata.Name)
 
 	case object.KindSQLConnection:
 		if spec, err := o.SQLConnection(); err == nil {

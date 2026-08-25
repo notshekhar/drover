@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"strings"
 
 	"gopkg.in/yaml.v3"
 )
@@ -25,10 +26,11 @@ const (
 	KindEnvironment   Kind = "Environment"
 	KindHTTPRequest   Kind = "HTTPRequest"
 	KindSQLConnection Kind = "SQLConnection"
+	KindDocumentStore Kind = "DocumentStore"
 )
 
 // Kinds is every kind drover knows, in the order they should be listed.
-var Kinds = []Kind{KindRepository, KindEnvironment, KindHTTPRequest, KindSQLConnection}
+var Kinds = []Kind{KindRepository, KindEnvironment, KindHTTPRequest, KindSQLConnection, KindDocumentStore}
 
 // Implemented reports whether this kind can be applied. Every kind is now
 // built; the method stays because it is where a future kind lands as
@@ -46,6 +48,8 @@ func (k Kind) Plural() string {
 		return "httprequests"
 	case KindSQLConnection:
 		return "sqlconnections"
+	case KindDocumentStore:
+		return "documentstores"
 	}
 	return ""
 }
@@ -60,7 +64,7 @@ func ParseKind(s string) (Kind, error) {
 			return k, nil
 		}
 	}
-	return "", fmt.Errorf("unknown kind %q (kinds are spelled in full: repository, environment, httprequest, sqlconnection)", s)
+	return "", fmt.Errorf("unknown kind %q (kinds are spelled in full: repository, environment, httprequest, sqlconnection, documentstore)", s)
 }
 
 func lower(s string) string {
@@ -77,6 +81,11 @@ func lower(s string) string {
 // there are no namespaces.
 type Meta struct {
 	Name string `yaml:"name"`
+
+	// Labels are free-form and are how a warehouse of forty checkouts stays
+	// navigable: `drover get repository -l team=billing`, and a grep scoped
+	// to a domain rather than to a path.
+	Labels map[string]string `yaml:"labels,omitempty"`
 
 	// Source and AppliedAt are written by the store, never by the user. They
 	// are what lets `drover get` say where an object came from, and what lets
@@ -208,14 +217,25 @@ func (o *Object) Validate() error {
 		}
 	}
 	if !known {
-		return fmt.Errorf("unknown kind %q (kinds are spelled in full: Repository, Environment, HTTPRequest, SQLConnection)", o.Kind)
+		return fmt.Errorf("unknown kind %q (kinds are spelled in full: Repository, Environment, HTTPRequest, SQLConnection, DocumentStore)", o.Kind)
 	}
 	if err := ValidateName(o.Metadata.Name); err != nil {
 		return fmt.Errorf("metadata.name: %w", err)
 	}
+	if err := ValidateLabels(o.Metadata.Labels); err != nil {
+		return fmt.Errorf("metadata.labels: %w", err)
+	}
 
 	switch o.Kind {
 	case KindRepository:
+		// A checkout is a top-level directory the file tools list, so its
+		// name competes with the names of the other roots.
+		if strings.Contains(o.Metadata.Name, ".") {
+			return fmt.Errorf("metadata.name: %q contains a dot, which is the namespace separator for objects declared inside a repository; a repository's own name is a directory and may not use it", o.Metadata.Name)
+		}
+		if Reserved(o.Metadata.Name) {
+			return fmt.Errorf("metadata.name: %q is reserved -- the file tools use it as a top-level root, so a checkout by that name would shadow it", o.Metadata.Name)
+		}
 		spec, err := o.Repository()
 		if err != nil {
 			return err
@@ -233,6 +253,17 @@ func (o *Object) Validate() error {
 			return err
 		}
 		return spec.Validate()
+	case KindDocumentStore:
+		// A store name is a path segment under documents/, exactly as a
+		// repository name is a top-level one.
+		if strings.Contains(o.Metadata.Name, ".") {
+			return fmt.Errorf("metadata.name: %q contains a dot; a document store's name is a directory", o.Metadata.Name)
+		}
+		spec, err := o.DocumentStore()
+		if err != nil {
+			return err
+		}
+		return spec.Validate()
 	case KindSQLConnection:
 		spec, err := o.SQLConnection()
 		if err != nil {
@@ -241,6 +272,21 @@ func (o *Object) Validate() error {
 		spec.allowInlinePasswords = o.allowInlinePasswords
 		return spec.Validate()
 	}
+	return nil
+}
+
+// ReplaceSpec writes a decoded spec back into the object.
+//
+// It exists for one caller: an object read out of a repository's own
+// .drover.yaml, whose environment references have to be namespaced before it
+// is stored. Rewriting the yaml node rather than carrying a parallel struct
+// keeps `get -o yaml` printing exactly what the store holds.
+func (o *Object) ReplaceSpec(v any) error {
+	var node yaml.Node
+	if err := node.Encode(v); err != nil {
+		return err
+	}
+	o.Spec = node
 	return nil
 }
 

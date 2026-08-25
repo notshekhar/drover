@@ -205,7 +205,7 @@ func TestGrepStopsOnCancelledContext(t *testing.T) {
 	if _, err := r.Grep(ctx, "export function", GrepOptions{}); !errors.Is(err, context.Canceled) {
 		t.Fatalf("grep with a cancelled context: got %v, want context.Canceled", err)
 	}
-	if _, err := r.Find(ctx, "*.ts", "", 0); !errors.Is(err, context.Canceled) {
+	if _, err := r.Find(ctx, "*.ts", FindOptions{Path: "", MaxResults: 0}); !errors.Is(err, context.Canceled) {
 		t.Fatalf("find with a cancelled context: got %v, want context.Canceled", err)
 	}
 }

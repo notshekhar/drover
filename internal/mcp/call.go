@@ -53,6 +53,8 @@ func (s *Server) callTool(ctx context.Context, params json.RawMessage) (any, *rp
 		return s.toolAPICall(ctx, req.Arguments), nil
 	case "sql_query":
 		return s.toolSQLQuery(ctx, req.Arguments), nil
+	case "doc_write":
+		return s.toolDocWrite(ctx, req.Arguments), nil
 	}
 
 	// Unknown tool is a protocol-level error: the call could not be made at
@@ -92,10 +94,16 @@ func (s *Server) toolLs(ctx context.Context, raw json.RawMessage) *CallResult {
 	}
 	fmt.Fprintf(&b, "%s:\n", where)
 	for _, e := range res.Entries {
-		switch e.Type {
-		case "dir":
+		switch {
+		case e.Root:
+			// A root is not a checkout, and a model that cannot tell them
+			// apart will grep a document store looking for source.
+			// The path, not the name: a nested root is only recognisable as one
+			// by its parent, and "documents/product" is what says which it is.
+			fmt.Fprintf(&b, "  %s/   (%s)\n", e.Name, rootBlurb(e.Path))
+		case e.Type == "dir":
 			fmt.Fprintf(&b, "  %s/\n", e.Name)
-		case "symlink":
+		case e.Type == "symlink":
 			fmt.Fprintf(&b, "  %s -> (symlink)\n", e.Name)
 		default:
 			fmt.Fprintf(&b, "  %s (%s)\n", e.Name, humanSize(e.Size))
@@ -148,7 +156,7 @@ func (s *Server) toolGrep(ctx context.Context, raw json.RawMessage) *CallResult 
 		return toolError("%v", err)
 	}
 	if len(res.Matches) == 0 {
-		return text("No matches for %q in %d file(s).", args.Pattern, res.Files)
+		return text("No matches for %q in %d file(s).%s", args.Pattern, res.Files, unsearchedNote(res.Unsearched))
 	}
 
 	var b strings.Builder
@@ -159,6 +167,7 @@ func (s *Server) toolGrep(ctx context.Context, raw json.RawMessage) *CallResult 
 	if res.Truncated {
 		b.WriteString("\n(more matches exist; narrow with path or include)\n")
 	}
+	b.WriteString(unsearchedNote(res.Unsearched))
 	return text("%s", b.String())
 }
 
@@ -175,7 +184,7 @@ func (s *Server) toolFind(ctx context.Context, raw json.RawMessage) *CallResult 
 		return toolError("%v", err)
 	}
 	if len(res.Paths) == 0 {
-		return text("No files match %q.", args.Pattern)
+		return text("No files match %q.%s", args.Pattern, unsearchedNote(res.Unsearched))
 	}
 
 	var b strings.Builder
@@ -186,6 +195,7 @@ func (s *Server) toolFind(ctx context.Context, raw json.RawMessage) *CallResult 
 	if res.Truncated {
 		b.WriteString("\n(more files exist; narrow the pattern)\n")
 	}
+	b.WriteString(unsearchedNote(res.Unsearched))
 	return text("%s", b.String())
 }
 
@@ -566,4 +576,47 @@ func describeFromYAML(doc, field string) string {
 		return v
 	}
 	return ""
+}
+
+// rootBlurb describes a top-level root that is not a checkout, so a model
+// listing the engine can tell what it would find inside one.
+func rootBlurb(name string) string {
+	switch name {
+	case "mirrors":
+		return "mirrored issues and pull requests, one markdown file each"
+	case "docs":
+		return "dumped database schemas and other generated reference"
+	case "documents":
+		return "document stores -- the one place you can write, with doc_write"
+	case "logs":
+		return "hydrated log windows"
+	}
+	// A nested root: one document store, named. The blurb says what it is
+	// rather than repeating the parent's.
+	if _, store, ok := strings.Cut(name, "/"); ok && store != "" {
+		return "document store"
+	}
+	return "a store"
+}
+
+// unsearchedNote names the roots a search with no path deliberately skipped.
+//
+// A bare search stays in the checkouts so that looking for a symbol does not
+// come back half pull-request prose. That is the right default and the wrong
+// silence: without this line, "no matches" means either "not in the code" or
+// "never looked", and a model cannot tell which.
+func unsearchedNote(roots []string) string {
+	if len(roots) == 0 {
+		return ""
+	}
+	var b strings.Builder
+	b.WriteString("\nNot searched: ")
+	for i, r := range roots {
+		if i > 0 {
+			b.WriteString(", ")
+		}
+		fmt.Fprintf(&b, "%s/ (%s)", r, rootBlurb(r))
+	}
+	fmt.Fprintf(&b, ". Pass path=%s to search there.\n", roots[0])
+	return b.String()
 }

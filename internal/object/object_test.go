@@ -109,13 +109,15 @@ func TestKindHasNoShortForm(t *testing.T) {
 }
 
 func TestValidateName(t *testing.T) {
-	ok := []string{"api", "a", "api-server", "x1", "1x", strings.Repeat("a", MaxNameLen)}
+	// One dot is legal: it is the namespace separator for an object a
+	// repository declared about itself.
+	ok := []string{"api", "a", "api-server", "x1", "1x", "api.get-user", strings.Repeat("a", MaxNameLen)}
 	for _, n := range ok {
 		if err := ValidateName(n); err != nil {
 			t.Errorf("ValidateName(%q) = %v, want ok", n, err)
 		}
 	}
-	bad := []string{"", "API", "Api", "-api", "api-", "api_server", "api.server", "api/server", "..", ".", "a b", strings.Repeat("a", MaxNameLen+1)}
+	bad := []string{"", "API", "Api", "-api", "api-", "api_server", "api/server", "..", ".", ".api", "api.", "a.b.c", "a b", strings.Repeat("a", MaxNameLen+1)}
 	for _, n := range bad {
 		if err := ValidateName(n); err == nil {
 			t.Errorf("ValidateName(%q) = nil, want an error", n)
