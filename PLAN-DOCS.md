@@ -1,5 +1,17 @@
 # drover — plan: document stores (shelved)
 
+**Status: BUILT 2026-08-25**, with one deviation. The `docs:` path prefix this
+document designs was not built: `internal/files` had already grown general
+named roots for the mirrors, so a store is a `documents/<name>` root instead.
+That costs no new path grammar, no colon-in-a-filename trap, and it keeps the
+separate-namespaces property this document argues for. Everything else here was
+built as designed -- the store is an object, the documents are files, and there
+is no tool that applies document yaml. Added beyond it: each store is a local
+git repository, so every agent write is a commit with attribution and a stated
+reason.
+
+The original status line follows.
+
 **Status: not built, and deliberately so.** The two MCP fixes this document
 was originally written alongside — an inventory of what the engine holds in
 the initialize handshake, and `drover://reference` / `drover://inventory` as

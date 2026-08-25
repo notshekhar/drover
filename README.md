@@ -121,6 +121,19 @@ on reload. Nothing to register, no list to maintain.
 
 Or keep the files anywhere and point at them with `drover apply -f`.
 
+Nobody hand-writes forty request files, so if you already have an OpenAPI spec
+or a Bruno collection:
+
+```bash
+drover import openapi -f openapi.yaml --prefix github --tag billing
+drover import bruno   -f ./my-collection
+```
+
+It prints yaml for you to read, edit and commit — an importer's guesses are the
+part worth looking at. `--out <file>` writes it, `--apply` applies it. A spec
+with more than 40 operations refuses and tells you the count, rather than
+producing 400 documents nobody asked for.
+
 Tell it about a repository:
 
 ```yaml
@@ -155,7 +168,7 @@ The agent now has `ls`, `read`, `grep` and `find` over that checkout.
 
 ## What you can apply
 
-Four kinds. Names are spelled out — `Repository`, never `Repo`.
+Five kinds. Names are spelled out — `Repository`, never `Repo`.
 
 ### Repository
 
@@ -179,6 +192,57 @@ timer, so one slow fetch never delays another.
 The tree is a **mirror**: every sync resets it to the remote. drover refuses to
 touch a directory it did not create, so it cannot eat a checkout of yours that
 happens to share a name.
+
+#### The discussion, not just the code
+
+`git` says what changed and who changed it. It cannot say **why** — why was
+argued in a pull request and filed in an issue, and neither is in the clone.
+
+```yaml
+spec:
+  mirror:
+    issues: true
+    pullRequests: true
+    since: 365d      # 90d, 6h, or all
+```
+
+Issues and pull requests land as markdown with a YAML header, reached as
+`mirrors/api/...`, so `grep '^state: open' mirrors/api/issues` works and so
+does grepping the argument itself.
+
+The file that makes it worth having is **`mirrors/api/index/commits.tsv`**,
+which maps a commit to the pull request that carried it. It is built from the
+checkout's own history at no API cost — both of GitHub's merge styles put the
+number in the commit subject — so an agent can go:
+
+```
+git blame  →  a1b2c3d  →  grep a1b2c3d mirrors/api/index/commits.tsv  →  pull 5678  →  read it
+```
+
+Four hops from a line of code to the argument about it. drover uses `gh` when
+it is on PATH (so enterprise SSO already works) and `GITHUB_TOKEN` otherwise.
+A large repository backfills across several syncs rather than stalling one,
+and a rate limit is recorded with its reset time rather than treated as a
+failure. A mirror that fails never marks the repository failed — the checkout
+is still perfectly searchable.
+
+#### Letting a repository describe itself
+
+A service knows which API it calls. Commit a `.drover.yaml` at its root and
+drover will read it — and then **quarantine it**, because a yaml file inside a
+clone is written by whoever can push to that repository:
+
+```bash
+drover review api        # prints exactly what would be applied
+```
+
+Nothing is applied until the Repository says `spec.trustConfig: true`. There is
+no command that flips a hidden switch: trust is a line in the document you
+already control. `Repository` and `SQLConnection` are never accepted from a
+repository at all — a clone target and a database url are the two things that
+reach the network on drover's own credentials. Names are namespaced
+(`api.get-user`) and labelled `drover.io/source: repository/api`, a prefix a
+document cannot forge.
 
 ### Environment
 
@@ -244,6 +308,37 @@ what it needs.
 **Only GET is offered to agents.** Other methods can be stored, and `drover
 call --allow-write` will run one for you, but they are never advertised.
 
+### DocumentStore
+
+The one place an agent can write.
+
+```yaml
+apiVersion: drover/v1
+kind: DocumentStore
+metadata:
+  name: product
+spec:
+  description: PRDs, TRDs and decision records for the billing platform.
+  writable: true        # default
+  history: true         # default
+```
+
+Everything else drover offers is read-only, which leaves a gap: the warehouse
+has nowhere to put what an agent worked out, so every session starts from
+nothing. Documents live at `documents/product/...`, are read with the `read`
+and `grep` an agent already has, and are written with **`doc_write`** — the
+only tool in drover that changes anything.
+
+**Every store is a local git repository.** Each write is a commit whose author
+is the agent's attribution and whose message is its stated reason, so "who
+wrote this and why" is answerable with the `git` tool that already exists, and
+nothing an agent writes is unrecoverable. It has no remote and drover never
+pushes.
+
+Markdown only, a write replaces the whole file, and an identical write is not
+a commit. `documents/` and `repos/` are separate trees because they have
+opposite durability rules: a checkout is disposable and a store is the truth.
+
 ### SQLConnection
 
 Postgres, MySQL or Redshift.
@@ -268,6 +363,13 @@ drover query analytics "SELECT count(*) FROM events"
 and a leading comment cannot disguise a write. Set `readOnly: false` to opt out
 deliberately. `health` is a gate: no health query, or a failing one, and no sql
 tool is offered at all.
+
+**The schema lands on disk.** When the gate passes, drover dumps every table,
+column, foreign key, index and row-count estimate to `docs/schema/<name>.sql`
+as DDL — so discovering the shape costs a `read` instead of a round trip, and
+`grep 'REFERENCES users' docs/schema` answers "what points at users" without
+opening a connection. Row counts are labelled as the estimates they are.
+`spec.schemas: [public, billing]` narrows it on a warehouse.
 
 ## MCP
 
@@ -310,9 +412,9 @@ Tools an agent gets:
 
 | tool | does |
 |---|---|
-| `ls` | list a directory; no path lists the repositories |
+| `ls` | list a directory; no path lists the repositories and the other roots |
 | `read` | read a file, numbered lines, offset/limit windows |
-| `grep` | RE2 search, with `path` and `include` filters; skips `node_modules`, `vendor`, `dist` and the rest |
+| `grep` | RE2 search, with `path`, `include` and `selector` filters; skips `node_modules`, `vendor`, `dist` and the rest |
 | `find` | glob on the name, or on the whole path when it has a slash; skips the same directories |
 | `git` | history: `log`, `show`, `diff`, `blame`, `search`, `file`, `branches`, `tags`, `contributors`, `status` |
 | `lsp` | code by meaning: `definition`, `references`, `hover`, `implementations`, `document_symbols`, `workspace_symbols`, `incoming_calls`, `outgoing_calls`, `diagnostics`, `servers` |
@@ -320,11 +422,22 @@ Tools an agent gets:
 | `api_describe` | one request's parameters in full |
 | `api_call` | perform a request |
 | `sql_query` | one read-only query against a named connection |
+| `doc_write` | write one markdown document into a store — the only tool that changes anything |
 
-**Ten tools, fixed.** Twenty requests do not become twenty tools — they
+**Eleven tools, fixed.** Twenty requests do not become twenty tools — they
 become entries `api_list` returns, the databases are listed inside
-`sql_query`'s own description, and ten history operations sit behind `git`'s
-`operation` argument rather than becoming ten more tools.
+`sql_query`'s own description, the stores are listed inside `doc_write`'s, and
+ten history operations sit behind `git`'s `operation` argument rather than
+becoming ten more tools.
+
+`doc_write` is offered only when a writable `DocumentStore` exists, so an
+engine with no store advertises no way to write at all.
+
+drover also answers **`prompts/list`** with prompts generated from what this
+engine actually holds — `investigate`, `onboard`, and `schema` when there is a
+database. They encode the order that works (grep → lsp → blame → the pull
+request the commit index names), which a model otherwise rediscovers badly
+every session.
 
 Search skips what nobody asked about. A real checkout is overwhelmingly
 dependencies and build output — on one repository we measured, 143,690 of
@@ -335,6 +448,28 @@ minified bundles before the walk ever reached the source: the same search that
 returned 140 dependency hits out of 200, topped by a `.js.map`, now returns the
 project's own code. Point `path` at one of those directories and it is searched
 normally — the list is about what a walk wanders into, not what it is aimed at.
+
+`ls` with no path lists the checkouts **and the other roots** — `mirrors/` for
+the issues and pull requests, `documents/` for the stores, `docs/` for the
+dumped schemas. A search with no `path` stays in the checkouts, so looking for
+a symbol does not come back half pull-request prose, and it says which roots it
+skipped so "no matches" never means two different things.
+
+**Labels scope a search to a domain instead of a directory.** Any object can
+carry `metadata.labels`, and the same expression works on the CLI and as
+`grep`'s `selector`:
+
+```bash
+drover get repository -l team=billing
+drover get repository -l 'tier!=frontend'
+```
+
+> grep for `ChargeIntent` with selector `team=billing`
+
+kubectl's grammar minus the parts nobody uses: `k=v`, `k!=v`, `k`, `!k`,
+comma-ANDed. A selector that matches nothing is an error rather than an empty
+result — searching zero files and reporting no matches is the most misleading
+answer a search tool can give.
 
 `grep` and `read` see the tree as it is now; `git` sees how it got that way —
 who changed a line, when a function first appeared, what a file looked like
@@ -369,7 +504,16 @@ file, no tool that POSTs, and no tool that writes to a database.
   objects/<Kind>/<name>.yaml the applied documents — the source of truth
   status/                    observed state, kept apart from desired state
   repos/<name>/              the checkouts
+  mirrors/<name>/            issues, pull requests, the commit index
+  documents/<store>/         document stores — the only writable tree
+  docs/schema/<name>.sql     dumped database schemas
+  pending/<name>.yaml        what an untrusted .drover.yaml would apply
 ```
+
+`repos/` is disposable — sync resets it to the remote and nothing is lost.
+`documents/` is the truth, and nothing else has a copy. They are separate
+trees so no code path that resets a checkout can be pointed at a store by a
+bug in name resolution.
 
 Apply persists. Restart the engine and it forgets nothing; delete the yaml you
 applied from and the engine still holds what you gave it.
@@ -384,12 +528,15 @@ applied from and the engine still holds what you gave it.
 drover serve                       run the engine (dashboard on a tty)
 drover dash                        open the dashboard for a running engine
 drover apply -f <file|dir>         apply objects (-f - reads stdin)
-drover get <kind> [name]           list or show objects
+drover get <kind> [name] [-l k=v]  list or show objects, filtered by label
 drover delete <kind> <name>        remove an object and its checkout
 drover sync [name]                 refresh now
 drover call <name> [-p k=v]        execute an HTTPRequest
 drover query <name> "SELECT ..."   query a SQLConnection
 drover health <name>               re-run a health gate
+drover review <repository>         show what a repository declares about itself
+drover import openapi -f <spec>    turn an OpenAPI spec into documents
+drover import bruno -f <dir>       turn a Bruno collection into documents
 drover mcp                         stdio MCP bridge
 drover forget <path>               drop a path from the apply list
 drover upgrade                     install the latest release

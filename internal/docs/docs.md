@@ -53,6 +53,8 @@ apiVersion: drover/v1
 kind: <Repository | Environment | HTTPRequest | SQLConnection>
 metadata:
   name: <name>
+  labels:            # optional
+    team: billing
 spec:
   ...
 ```
@@ -72,6 +74,36 @@ spec:
 - **An unknown field is an error**, not a warning. A typo like
   `refreshIntervl` fails the apply rather than being silently ignored.
 - Apply is all-or-nothing. One bad document means nothing is written.
+- **Names may not be `mirrors`, `docs` or `logs`.** Those are top-level
+  directories the file tools use for things that are not checkouts, so a
+  repository by one of those names would shadow one.
+
+### Labels
+
+`metadata.labels` is an optional map on any object. Keys and values are
+lowercase letters, digits, dashes and underscores; a key may carry a prefix
+(`app.kubernetes.io/part-of`). The `drover.io/` prefix is reserved for labels
+drover writes itself.
+
+Labels are what keep a warehouse of forty checkouts navigable:
+
+```bash
+drover get repository -l team=billing
+drover get repository -l tier!=frontend
+drover get repository -l owner            # the label exists
+drover get repository -l '!owner'         # it does not
+```
+
+Clauses are comma-separated and ANDed: `-l team=billing,tier=backend`. There
+is no OR and there are no set operators.
+
+The same expression works as `selector` on the `grep` and `find` tools, which
+is how an agent searches a domain rather than a directory:
+
+> grep for `ChargeIntent` with selector `team=billing`
+
+A selector and a `path` cannot be given together — the selector already says
+which checkouts to search.
 
 ---
 
@@ -136,6 +168,144 @@ token in the yaml.
 edit files in `~/.drover/repos/`. drover refuses to touch a directory it did
 not create, so it cannot destroy a checkout of your own that happens to share
 a name.
+
+---
+
+### trustConfig — letting a repository describe itself
+
+A service knows which API it calls and where its docs are. Rather than
+transcribe that into `~/.drover` by hand, commit a **`.drover.yaml`** at the
+repository root:
+
+```yaml
+# committed in acme/api
+apiVersion: drover/v1
+kind: Environment
+metadata: {name: prod}
+spec:
+  variables: {baseUrl: https://api.acme.com}
+---
+apiVersion: drover/v1
+kind: HTTPRequest
+metadata: {name: get-user}
+spec: {...}
+```
+
+**It is not applied until you say so.** A yaml file inside a clone is written
+by whoever can push to that repository, which is not necessarily you. So
+drover parses it, shows it, and leaves it inert:
+
+```bash
+drover review api        # prints exactly what would be applied
+```
+
+If you have read it and want it:
+
+```yaml
+kind: Repository
+spec:
+  trustConfig: true
+```
+
+There is no `drover trust` command that flips a hidden switch — trust is a
+line in the document you already control, so it lives where the rest of your
+desired state lives.
+
+Rules that hold whether or not you trust it:
+
+- **`Repository` and `SQLConnection` are never accepted from a repository.** A
+  clone target and a database url are the two things that reach the network on
+  drover's own credentials.
+- **Names are namespaced.** `get-user` becomes `api.get-user`, so two
+  repositories cannot collide, and an environment reference inside the file is
+  namespaced with it.
+- **drover labels what it took**: `drover.io/source: repository/api`. The
+  `drover.io/` prefix is reserved, so a document cannot forge it — list what a
+  repository contributed with
+  `drover get httprequest -l drover.io/source=repository/api`.
+- The file is size-capped before it is parsed, and a malformed one is
+  reported against the config, never against the checkout.
+
+### mirror — the discussion beside the code
+
+`git` says what changed and who changed it. It cannot say **why**, because why
+was argued in a pull request and filed in an issue, and neither is in the
+clone. Ask drover to mirror them:
+
+```yaml
+apiVersion: drover/v1
+kind: Repository
+metadata:
+  name: api
+spec:
+  url: https://github.com/acme/api
+  branch: main
+  mirror:
+    issues: true
+    pullRequests: true
+    since: 365d        # 90d, 6h, or all. Default 365d.
+    state: all         # all | open. Default all.
+    comments: true     # the thread, not just the opening body. Default true.
+```
+
+The result is markdown on disk, one file per item, reached by an agent as
+`mirrors/api/...`:
+
+```
+mirrors/api/
+  issues/1234.md         frontmatter + body + the whole thread
+  pulls/5678.md
+  index/commits.tsv      sha -> pull request number
+  cursor.yaml            how far it has read; delete to re-mirror
+```
+
+Each file opens with a YAML header, so structure is greppable without making
+the prose unreadable:
+
+```markdown
+---
+number: 5678
+kind: pull
+state: merged
+title: rate limit the webhook endpoint
+author: someone
+labels: [backend, incident-followup]
+---
+```
+
+`grep '^state: open' mirrors/api/issues` works. So does grepping the argument.
+
+**`index/commits.tsv` is the reason this exists.** It maps a commit to the
+pull request that carried it, built from the checkout's own history at no API
+cost, so an agent can go:
+
+```
+git blame  ->  a1b2c3d  ->  grep a1b2c3d mirrors/api/index/commits.tsv  ->  pull 5678  ->  read it
+```
+
+Four hops from a line of code to the argument about it.
+
+**Authentication.** drover uses `gh` if it is on PATH, which means enterprise
+SSO and token refresh already work. Otherwise it uses `GITHUB_TOKEN` or
+`GH_TOKEN`. A public repository works with neither, at a lower rate limit.
+`drover get repository` says which one is in use.
+
+**A big repository backfills over several syncs.** One run reads at most 20
+pages per stream, records how far it got, and continues on the next tick — so
+the mirror is usable, partially, the whole way through rather than stalling a
+sync for minutes. A rate limit is recorded with the time it resets and is not
+treated as a failure.
+
+**A mirror failure is never a repository failure.** GitHub being unreachable
+does not make the checkout less searchable, so it is reported on its own line
+and `STATUS` stays `ready`.
+
+**Searches stay in the code by default.** `grep` with no `path` searches the
+checkouts, not the mirrors — a search for a function name should not come back
+half pull-request prose. The result says which roots it skipped. Pass
+`path: mirrors/api` to search the discussion.
+
+Only GitHub, for now.
 
 ---
 
@@ -263,6 +433,31 @@ secret by asking for it as an argument.
 and run it yourself with `drover call <name> --allow-write`, but it will
 never be advertised as a tool. In the dashboard those show a hollow `○`.
 
+### Importing a collection you already have
+
+Nobody hand-writes forty request files. If there is an OpenAPI spec or a Bruno
+collection, convert it:
+
+```bash
+drover import openapi -f openapi.yaml --prefix github --environment prod
+drover import bruno   -f ./my-collection --prefix acme
+```
+
+It prints yaml to stdout. That is deliberate: what comes out is an ordinary
+document you can read, edit and commit, and an importer's guesses are the part
+worth looking at. Write it somewhere with `--out billing.yaml`, or pass
+`--apply` once you trust it.
+
+- `--tag billing` narrows an OpenAPI import to one tag.
+- A spec with more than 40 operations **refuses** and tells you the count.
+  Narrow it, or pass `--all`.
+- Operations drover cannot express are skipped with the reason on stderr —
+  most often a `header` parameter, which drover will not let a caller set.
+- Missing descriptions are derived from whatever the spec did say (type,
+  enum, default), because a parameter with no description is refused at apply.
+- Non-GET operations are imported and stored; drover's normal rule still
+  applies, so they are never advertised to an agent.
+
 ### A whole collection in one file
 
 ```yaml
@@ -325,6 +520,69 @@ spec:
     - name: Authorization
       value: "Bearer {{token}}"
 ```
+
+---
+
+## DocumentStore — the one place an agent can write
+
+Everything else drover offers is read-only: GET requests, read-only SQL, file
+tools with no write. That leaves a gap — the warehouse has nowhere to put what
+an agent worked out, so every session starts from nothing. A document store is
+that place, and it is deliberately the narrowest possible exception.
+
+```yaml
+apiVersion: drover/v1
+kind: DocumentStore
+metadata:
+  name: product
+spec:
+  description: PRDs, TRDs and decision records for the billing platform.
+  path: /Users/you/work/product-docs   # optional; defaults into the data dir
+  writable: true                       # default true
+  history: true                        # default true; see below
+```
+
+`description` is not decoration: it goes in the connection inventory and in
+the write tool's catalogue, so a model is told *product is where PRDs live*
+rather than guessing from the name.
+
+An agent reaches it at `documents/<store>/...`:
+
+```
+documents/product/prd-billing.md
+documents/product/decisions/0001-why-postgres.md
+```
+
+Reads go through `read` and `grep` like everything else — there is no
+`doc_read`. Writes go through the one write tool:
+
+```
+doc_write  store=product  path=decisions/0001-why-postgres.md
+           content="# Why postgres\n..."  reason="record the decision"
+```
+
+Rules, all of them deliberate:
+
+- **Markdown only.** A store holds prose that `grep` can read; a binary blob
+  in there is a result nobody can read and a file nobody can review.
+- **A write replaces the whole file.** `read` it first if you mean to edit.
+- **Every store is a local git repository.** Each write is a commit whose
+  author is the agent's attribution and whose message is its stated reason, so
+  "who wrote this and why" is answerable with the `git` tool that already
+  exists, and nothing an agent writes is unrecoverable. It has no remote and
+  drover never pushes. Set `history: false` to turn it off.
+- **An identical write is not a commit.** Rewriting the same bytes would fill
+  the history with nothing, and the history is the reason it is worth keeping.
+- **`writable: false`** makes a store an agent can read and cannot change,
+  which is what you want for somebody else's documents.
+- **A store with its own `spec.path` is never deleted.** `drover delete`
+  stops drover offering it; it does not destroy a directory drover did not
+  create.
+
+`documents/` and `repos/` are separate trees on disk for the reason that
+matters: **they have opposite durability rules.** A checkout is disposable —
+sync resets it to the remote and nothing is lost. A store is the truth;
+nothing else has a copy.
 
 ---
 
@@ -393,6 +651,40 @@ spec:
 ```
 
 Think hard before doing that on a database an agent can reach.
+
+### The schema lands on disk
+
+When the health gate passes, drover dumps the database's shape to
+**`docs/schema/<name>.sql`** — every table, column, foreign key, index and
+row-count estimate, as DDL:
+
+```sql
+CREATE TABLE events (
+  id          bigint      NOT NULL,
+  user_id     bigint      NOT NULL REFERENCES users(id),
+  created_at  timestamptz NOT NULL DEFAULT now()
+);  -- ~48,200,000 rows
+CREATE INDEX events_user_id_created_at ON events (user_id, created_at DESC);
+```
+
+An agent reads or greps that file instead of spending its first query on
+`information_schema`. `grep 'REFERENCES users' docs/schema` answers "what
+points at users" without opening a connection at all.
+
+Row counts are **estimates** from the database's own statistics — good enough
+to choose a join order or refuse a `SELECT *`, wrong enough that they should
+never be reported as fact. The file says so at the top.
+
+Narrow it on a warehouse with thousands of tables:
+
+```yaml
+spec:
+  schemas: [public, billing]
+```
+
+The dump is refreshed at most once an hour, runs through the same read-only
+path a query does, and a dump that fails never fails the health check — the
+connection is still queryable, it is just less convenient.
 
 ### The health gate
 
