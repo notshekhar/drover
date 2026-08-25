@@ -101,6 +101,11 @@ type SQLConnectionSpec struct {
 
 	// TimeoutSeconds caps one query.
 	TimeoutSeconds int `yaml:"timeoutSeconds,omitempty"`
+
+	// Schemas narrows the schema dump. Unset dumps everything that is not a
+	// system catalog, which is right for an application database and wrong
+	// for a warehouse with ten thousand tables.
+	Schemas []string `yaml:"schemas,omitempty"`
 }
 
 // DefaultMaxRows is the row cap when a document does not set one.
