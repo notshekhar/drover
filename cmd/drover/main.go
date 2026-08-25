@@ -55,6 +55,10 @@ func run(ctx context.Context, args []string) error {
 		return cmdQuery(ctx, rest)
 	case "health":
 		return cmdHealth(ctx, rest)
+	case "review":
+		return cmdReview(ctx, rest)
+	case "import":
+		return cmdImport(ctx, rest)
 	case "forget":
 		return cmdForget(ctx, rest)
 	case "upgrade", "update", "self-update":
@@ -85,6 +89,9 @@ Usage:
   drover query <name> "SELECT ..."  query a SQLConnection
   drover health <name>              re-run a SQLConnection's health gate
   drover mcp                        bridge an agent's stdio to the engine (MCP)
+  drover review <repository>        show what a repository declares about itself
+  drover import openapi -f <spec>   turn an OpenAPI spec into documents
+  drover import bruno -f <dir>      turn a Bruno collection into documents
   drover forget <path>              drop a path from the config apply list
   drover upgrade                    install the latest release
   drover version
@@ -104,6 +111,7 @@ Examples:
   drover get repository api -o yaml
   drover call get-user -p userId=usr_1a2b3c --environment prod
   drover query analytics "SELECT count(*) FROM events"
+  drover import openapi -f openapi.yaml --tag billing --out billing.yaml
 
 Point an agent at the engine over MCP. drover serve hosts it at /mcp:
   claude mcp add --transport http drover http://127.0.0.1:7432/mcp
