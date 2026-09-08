@@ -103,6 +103,63 @@ func (s *Server) RefreshIndex(ctx context.Context) {
 	fmt.Fprintf(s.opts.Log, "search index built: %d files in %.1fs\n", len(paths), time.Since(start).Seconds())
 }
 
+// indexDebounce is how long a rebuild request waits for more to arrive.
+//
+// `drover sync` kicks every repository at once, so a warehouse of fifty
+// repositories fires fifty rebuild requests within a second or two. Each
+// rebuild walks and reads the entire warehouse; running fifty of them is
+// fifty times the work for one useful result. Waiting a moment collapses the
+// burst into a single build after the last repository lands.
+const indexDebounce = 3 * time.Second
+
+// requestIndexRefresh asks for a rebuild, coalescing bursts into one.
+//
+// At most one build runs at a time, and at most one more is queued behind it:
+// requests that arrive while a build is in flight collapse into a single
+// follow-up, because "rebuild from the current state" is idempotent and doing
+// it twice in a row would only repeat the same work.
+func (s *Server) requestIndexRefresh() {
+	s.indexJobMu.Lock()
+	defer s.indexJobMu.Unlock()
+	s.indexPending = true
+	if s.indexRunning {
+		return
+	}
+	s.indexRunning = true
+	go s.indexRefreshLoop()
+}
+
+func (s *Server) indexRefreshLoop() {
+	for {
+		// Let the burst settle before doing anything expensive.
+		select {
+		case <-time.After(indexDebounce):
+		case <-s.indexStop:
+			s.indexJobMu.Lock()
+			s.indexRunning = false
+			s.indexJobMu.Unlock()
+			return
+		}
+
+		s.indexJobMu.Lock()
+		if !s.indexPending {
+			s.indexRunning = false
+			s.indexJobMu.Unlock()
+			return
+		}
+		s.indexPending = false
+		s.indexJobMu.Unlock()
+
+		// refreshForTest lets the scheduler be tested without a warehouse;
+		// it is nil everywhere else.
+		if s.refreshForTest != nil {
+			s.refreshForTest()
+		} else {
+			s.RefreshIndex(context.Background())
+		}
+	}
+}
+
 // currentIndex returns the attached index, or nil.
 func (s *Server) currentIndex() *tindex.Index {
 	s.indexMu.RLock()
@@ -110,8 +167,9 @@ func (s *Server) currentIndex() *tindex.Index {
 	return s.index
 }
 
-// closeIndex releases the index at shutdown.
+// closeIndex stops any pending rebuild and releases the index at shutdown.
 func (s *Server) closeIndex() {
+	s.indexStopOnce.Do(func() { close(s.indexStop) })
 	s.detachIndex()
 }
 

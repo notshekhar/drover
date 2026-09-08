@@ -95,11 +95,21 @@ type Server struct {
 	// correct — see internal/server/index.go.
 	indexMu sync.RWMutex
 	index   *tindex.Index
-	git     *git.Repos
-	lsp     *lsp.Manager
-	ledger  *activity.Ledger
-	exec    mcp.Backend
-	mux     *http.ServeMux
+
+	// indexJobMu guards the rebuild scheduler: one build at a time, with at
+	// most one more queued, so a sync of many repositories rebuilds once.
+	indexJobMu    sync.Mutex
+	indexRunning  bool
+	indexPending  bool
+	indexStop     chan struct{}
+	indexStopOnce sync.Once
+	// refreshForTest replaces the rebuild in the scheduler's tests.
+	refreshForTest func()
+	git            *git.Repos
+	lsp            *lsp.Manager
+	ledger         *activity.Ledger
+	exec           mcp.Backend
+	mux            *http.ServeMux
 	// handler is the mux behind the guard, and is the only thing anything
 	// serves. Keeping the bare mux reachable is how the guard came to be
 	// applied to Handler() and not to Serve(): one field, one answer.
@@ -146,7 +156,8 @@ func New(opts Options) (*Server, error) {
 		git:                  git.New(opts.DataDir),
 		allowInlinePasswords: opts.AllowInlinePasswords,
 
-		started: time.Now(),
+		started:   time.Now(),
+		indexStop: make(chan struct{}),
 	}
 	// Language servers are wired up unconditionally, like the file tools they
 	// sit beside. Nothing is launched here: a server starts the first time
@@ -217,7 +228,7 @@ func (s *Server) restartLanguageServers(repository string) {
 // one is installed, since a stale index costs reads rather than results.
 func (s *Server) onCheckoutChanged(repository string) {
 	s.restartLanguageServers(repository)
-	go s.RefreshIndex(context.Background())
+	s.requestIndexRefresh()
 }
 
 // Store exposes the object store, for tests and for the CLI's local paths.

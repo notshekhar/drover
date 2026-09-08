@@ -44,6 +44,7 @@ import (
 	"os"
 	"path/filepath"
 	"sync"
+	"sync/atomic"
 
 	tgindex "github.com/notshekhar/tgrep-go/index"
 	"github.com/notshekhar/tgrep-go/matching"
@@ -88,32 +89,63 @@ func Dir(dataDir string) string { return filepath.Join(dataDir, "index") }
 // contract: file ids are positional. The caller passes the same enumeration it
 // would have searched, which is what keeps the index and the walk agreeing
 // about what exists.
+// buildSeq gives each concurrent build its own staging directory.
+var buildSeq atomic.Uint64
+
+// swapMu serialises the destructive half of a build.
+//
+// Two builds sharing one staging directory tore each other apart — measured,
+// four of eight failing, and one of the failures left NO index in place at all
+// because one builder removed the live directory while another was mid-swap.
+// Unique staging directories fix the first half; this fixes the second, so the
+// live index goes from one complete state to another and is never absent.
+//
+// A process-level lock is the right scope: drover is one engine process, and
+// two engines over one data directory is already a configuration error.
+var swapMu sync.Mutex
+
 func Build(ctx context.Context, dataDir, root string, paths []string) (*Index, error) {
 	dir := Dir(dataDir)
-	// A build writes into a fresh directory and swaps, so a crash midway
+	// A build writes into a directory of its own and swaps, so a crash midway
 	// leaves the previous index intact rather than a half-written one that
-	// would read as authoritative.
-	staging := dir + ".building"
+	// would read as authoritative — and so two builds cannot write over each
+	// other's work.
+	staging := fmt.Sprintf("%s.building-%d-%d", dir, os.Getpid(), buildSeq.Add(1))
 	if err := os.RemoveAll(staging); err != nil {
 		return nil, err
 	}
+	defer os.RemoveAll(staging)
+
 	if _, err := tgindex.BuildFromPaths(staging, root, paths, tgindex.Options{Complete: true}); err != nil {
-		os.RemoveAll(staging)
 		return nil, fmt.Errorf("building the index: %w", err)
 	}
 	if err := ctx.Err(); err != nil {
-		os.RemoveAll(staging)
 		return nil, err
 	}
 
-	if err := os.RemoveAll(dir); err != nil {
-		os.RemoveAll(staging)
-		return nil, err
+	// The swap AND the open that follows it happen under one lock.
+	//
+	// Opening outside the lock was not enough: the new index is read back from
+	// the live path, and another builder swapping at that moment moves the
+	// directory out from under the read. Measured — it failed two builds in
+	// eight even with unique staging directories.
+	swapMu.Lock()
+	defer swapMu.Unlock()
+
+	// Rename cannot replace a non-empty directory, so the old one moves aside
+	// first. Both renames are inside the lock, so no other builder observes
+	// the live path missing.
+	retired := fmt.Sprintf("%s.retired-%d", dir, buildSeq.Add(1))
+	if _, statErr := os.Stat(dir); statErr == nil {
+		if err := os.Rename(dir, retired); err != nil {
+			return nil, err
+		}
+		defer os.RemoveAll(retired)
 	}
 	if err := os.Rename(staging, dir); err != nil {
-		os.RemoveAll(staging)
 		return nil, err
 	}
+
 	return Open(dataDir, root)
 }
 
