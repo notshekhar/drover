@@ -5,7 +5,7 @@ go 1.27.0
 require (
 	github.com/go-sql-driver/mysql v1.10.0
 	github.com/jackc/pgx/v5 v5.10.0
-	github.com/notshekhar/tgrep-go v0.0.0-20260908151659-60b75988a396
+	github.com/notshekhar/tgrep-go v0.1.0
 	golang.org/x/term v0.45.0
 	gopkg.in/yaml.v3 v3.0.1
 	modernc.org/sqlite v1.57.0

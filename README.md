@@ -508,7 +508,21 @@ file, no tool that POSTs, and no tool that writes to a database.
   documents/<store>/         document stores — the only writable tree
   docs/schema/<name>.sql     dumped database schemas
   pending/<name>.yaml        what an untrusted .drover.yaml would apply
+  index/                     trigram index for grep, on large warehouses only
 ```
+
+`index/` appears only once a warehouse passes 10,000 files, and disappears
+again if it drops back below. Below that a `grep` already answers in single
+digit milliseconds and an index would be work done for nothing — measured at
+8ms over 555 files, 57ms over 5,000, and 3.5-4.9s over 100,000, where it is
+worth about 8x. It is rebuilt after a sync moves any checkout to a new commit.
+
+The index only decides which files a search opens. Matching, ordering and the
+result cap are the same code with or without one, so an index that is stale,
+absent or over-broad costs time and cannot change an answer — and a file whose
+size or modified time no longer matches what was indexed is searched regardless,
+so an edit made since the last sync is never missed. `drover status` reports
+whether one is attached.
 
 `repos/` is disposable — sync resets it to the remote and nothing is lost.
 `documents/` is the truth, and nothing else has a copy. They are separate
