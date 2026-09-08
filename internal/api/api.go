@@ -384,10 +384,24 @@ type DashEnv struct {
 }
 
 // StatusResponse answers "is the engine up and what is it holding".
+// SearchIndexStatus reports whether searches are being narrowed by an index.
+//
+// Attached false is the normal state for a small warehouse: below Threshold
+// files a plain search is already instant and an index would only cost work.
+type SearchIndexStatus struct {
+	Attached  bool `json:"attached"`
+	Files     int  `json:"files,omitempty"`
+	Threshold int  `json:"threshold"`
+}
+
 type StatusResponse struct {
 	Version string `json:"version"`
 	DataDir string `json:"dataDir"`
 	Objects int    `json:"objects"`
+	// SearchIndex describes the optional trigram index, so an operator can
+	// tell a search that found nothing from one running against a warehouse
+	// too large to be searching without an index.
+	SearchIndex *SearchIndexStatus `json:"searchIndex,omitempty"`
 }
 
 // --- git tool ---

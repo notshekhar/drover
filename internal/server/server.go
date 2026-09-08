@@ -37,6 +37,7 @@ import (
 	"github.com/notshekhar/drover/internal/sqldb"
 	"github.com/notshekhar/drover/internal/store"
 	syncmgr "github.com/notshekhar/drover/internal/sync"
+	"github.com/notshekhar/drover/internal/tindex"
 	"github.com/notshekhar/drover/internal/web"
 )
 
@@ -88,11 +89,17 @@ type Server struct {
 	http   *httpreq.Executor
 	sql    *sqldb.Pool
 	files  *files.Root
-	git    *git.Repos
-	lsp    *lsp.Manager
-	ledger *activity.Ledger
-	exec   mcp.Backend
-	mux    *http.ServeMux
+
+	// index is the optional trigram index, and indexMu guards swapping it.
+	// Nil means searches run the plain way, which is the default and is
+	// correct — see internal/server/index.go.
+	indexMu sync.RWMutex
+	index   *tindex.Index
+	git     *git.Repos
+	lsp     *lsp.Manager
+	ledger  *activity.Ledger
+	exec    mcp.Backend
+	mux     *http.ServeMux
 	// handler is the mux behind the guard, and is the only thing anything
 	// serves. Keeping the bare mux reachable is how the guard came to be
 	// applied to Handler() and not to Serve(): one field, one answer.
@@ -149,6 +156,11 @@ func New(opts Options) (*Server, error) {
 	if serversDir == "" {
 		serversDir = lsp.DefaultDir()
 	}
+	// An index left by a previous run is picked up before the first search.
+	// Nothing is built here: building walks the whole warehouse, which is not
+	// something starting an engine should wait on.
+	s.attachIndex()
+
 	acquirer := lsp.NewAcquirer(serversDir)
 	acquirer.NoInstall = opts.NoServerInstall || os.Getenv("DROVER_NO_SERVER_INSTALL") != ""
 	s.lsp = lsp.NewManager(s.files, acquirer)
@@ -164,7 +176,7 @@ func New(opts Options) (*Server, error) {
 			Log:          opts.Log,
 			// Reconcile resets the working tree, so a server that has already
 			// parsed it is now answering about a tree that no longer exists.
-			OnCommitChanged: s.restartLanguageServers,
+			OnCommitChanged: s.onCheckoutChanged,
 		})
 	}
 
@@ -194,6 +206,18 @@ func (s *Server) restartLanguageServers(repository string) {
 	}
 	s.logf("repository %s: restarting its language servers", repository)
 	s.lsp.Restart(repository)
+}
+
+// onCheckoutChanged is what a reconcile triggers: language servers restart,
+// and the search index is rebuilt because the files it describes have moved.
+//
+// The rebuild runs on its own goroutine. It walks and reads the whole
+// warehouse, which on a large one takes seconds, and a sync must not block on
+// it — searches keep working throughout, on the previous index until the new
+// one is installed, since a stale index costs reads rather than results.
+func (s *Server) onCheckoutChanged(repository string) {
+	s.restartLanguageServers(repository)
+	go s.RefreshIndex(context.Background())
 }
 
 // Store exposes the object store, for tests and for the CLI's local paths.
@@ -520,6 +544,7 @@ func (s *Server) Shutdown(ctx context.Context) error {
 	// new can arrive while they are being torn down.
 	s.StopSync()
 	s.sql.Close()
+	s.closeIndex()
 	_ = s.ledger.Close()
 	return err
 }
@@ -606,6 +631,8 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 		Version: s.opts.Version,
 		DataDir: s.opts.DataDir,
 		Objects: len(objs),
+
+		SearchIndex: s.indexStatus(),
 	})
 }
 

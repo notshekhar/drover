@@ -108,6 +108,27 @@ type Root struct {
 	// drover writes through this jail, and the default -- an empty set --
 	// is what keeps every root read-only unless something says otherwise.
 	Writable map[string]bool
+
+	// Index, when set, narrows a search to the files that could match.
+	//
+	// Optional on purpose. A small warehouse searches in single-digit
+	// milliseconds, where an index is pure overhead -- see internal/tindex for
+	// the measurements and the threshold. Nil means every search walks and
+	// reads exactly as it always did.
+	Index Narrower
+}
+
+// Narrower is the part of an index a search uses: given a pattern and the
+// paths in scope, which of them are worth opening.
+//
+// An interface rather than a concrete type so internal/files does not depend
+// on the index implementation, and so a test can supply a deliberately
+// wrong one to prove the search still returns the right answer.
+type Narrower interface {
+	// Candidates returns a subset of known. An error means no narrowing was
+	// possible and every path must be searched -- which is the safe direction,
+	// and the one a caller gets by ignoring the error and keeping its own list.
+	Candidates(pattern string, caseSensitive bool, known []string) ([]string, error)
 }
 
 // ExtraRootNames are the top-level names reserved for extra roots. They are
@@ -787,6 +808,19 @@ func (r *Root) Grep(ctx context.Context, pattern string, opts GrepOptions) (*Gre
 		return nil, err
 	}
 
+	// Narrow to the files that could match, when an index is attached and the
+	// pattern gives it something to work with.
+	//
+	// This is the ONLY thing the index is allowed to do. Everything after it —
+	// which lines matched, how they are ordered, where the cap falls — is the
+	// same code that runs without one, reading the same bytes off disk. An
+	// index that is stale or over-broad therefore costs time and cannot change
+	// an answer; see internal/tindex for why it also cannot be too narrow.
+	searched := len(paths)
+	if narrowed, ok := r.narrow(pattern, opts.CaseSensitive, paths); ok {
+		paths = narrowed
+	}
+
 	matches := r.grepAll(ctx, paths, re, probe)
 	sort.Slice(matches, func(i, j int) bool {
 		if matches[i].Path != matches[j].Path {
@@ -795,7 +829,11 @@ func (r *Root) Grep(ctx context.Context, pattern string, opts GrepOptions) (*Gre
 		return matches[i].Line < matches[j].Line
 	})
 
-	out := &GrepResult{Matches: matches, Files: len(paths), Unsearched: r.unsearched(opts.Path, opts.Only)}
+	// Files counts what the SCOPE held, not what the index left. A caller
+	// reading "12 files searched" wants to know how much of the warehouse the
+	// query covered; reporting the post-narrowing number would make an
+	// effective index look like a small search.
+	out := &GrepResult{Matches: matches, Files: searched, Unsearched: r.unsearched(opts.Path, opts.Only)}
 	if out.Matches == nil {
 		out.Matches = []Match{}
 	}
@@ -804,6 +842,69 @@ func (r *Root) Grep(ctx context.Context, pattern string, opts GrepOptions) (*Gre
 		out.Truncated = true
 	}
 	return out, nil
+}
+
+// Enumerate returns every file a bare search would walk, root-relative and
+// sorted.
+//
+// It exists for the index builder, and it deliberately reuses the search's own
+// walk rather than a second traversal of its own. That is the whole guarantee:
+// an index built from this list covers exactly the files a search would have
+// read, so the two cannot come to disagree about what the warehouse contains.
+//
+// Sorted because file ids in the index are positional — the same warehouse has
+// to enumerate the same way twice, or a rebuilt index is a different index.
+func (r *Root) Enumerate(ctx context.Context) ([]string, error) {
+	bases, err := r.searchBases("", nil)
+	if err != nil {
+		return nil, err
+	}
+	var out []string
+	err = r.walkAll(ctx, bases, func(abs string, d os.DirEntry) error {
+		out = append(out, r.display(abs))
+		return nil
+	})
+	if err != nil && !errors.Is(err, errStop) {
+		return nil, err
+	}
+	sort.Strings(out)
+	return out, nil
+}
+
+// narrow asks the index which of these paths could match.
+//
+// ok is false whenever the answer is "all of them" -- no index, an
+// unnarrowable pattern, or an index that failed -- so the caller keeps the
+// full list. Every one of those is a fallback to the behaviour drover had
+// before an index existed, which is why none of them is reported as an error:
+// there is nothing for a user to do about it and nothing wrong with the
+// result.
+func (r *Root) narrow(pattern string, caseSensitive bool, paths []string) ([]string, bool) {
+	if r.Index == nil {
+		return nil, false
+	}
+	// The index speaks in root-relative, forward-slash paths; the walk
+	// collected absolute ones. Convert, ask, convert back.
+	rel := make([]string, 0, len(paths))
+	byRel := make(map[string]string, len(paths))
+	for _, abs := range paths {
+		key := r.display(abs)
+		rel = append(rel, key)
+		byRel[key] = abs
+	}
+
+	kept, err := r.Index.Candidates(pattern, caseSensitive, rel)
+	if err != nil {
+		return nil, false
+	}
+
+	out := make([]string, 0, len(kept))
+	for _, key := range kept {
+		if abs, ok := byRel[key]; ok {
+			out = append(out, abs)
+		}
+	}
+	return out, true
 }
 
 // unsearched names the extra roots a search with no path did not walk.
