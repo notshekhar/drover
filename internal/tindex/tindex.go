@@ -88,7 +88,9 @@ func Dir(dataDir string) string { return filepath.Join(dataDir, "index") }
 // paths are relative to root and use forward slashes, and their ORDER is the
 // contract: file ids are positional. The caller passes the same enumeration it
 // would have searched, which is what keeps the index and the walk agreeing
-// about what exists.
+// about what exists. The one exception is a path an index cannot store safely
+// (a backslash, a non-UTF-8 name): tgrep-go leaves it out, it has no stamp, and
+// Candidates therefore always searches it.
 // buildSeq gives each concurrent build its own staging directory.
 var buildSeq atomic.Uint64
 

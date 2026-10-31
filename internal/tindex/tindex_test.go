@@ -52,6 +52,12 @@ var corpus = map[string]string{
 	"web/unicode.txt": "héllo wörld\nhandler ünicode\n",
 	"docs/spec.md":    "no match in this one\n",
 	"noeol/last.go":   "func handler4() {}",
+	// Each matches a case-insensitive search only through Unicode folding,
+	// which the index's ASCII lowercasing cannot see: ſ (U+017F) folds to s,
+	// K (Kelvin) to k, and é/É are a non-ASCII pair.
+	"fold/long-s.txt": "ſhellſhocK\n",
+	"fold/upper.txt":  "CAFÉ AU LAIT\n",
+	"fold/lower.txt":  "café au lait\n",
 }
 
 // TestRealIndexNeverChangesTheAnswer is the conformance test that matters: the
@@ -64,6 +70,7 @@ func TestRealIndexNeverChangesTheAnswer(t *testing.T) {
 		"h.ndler", "handler|Writer", "[hH]andler", "wörld", "documented",
 		"zzznotpresent", "e", "(?:handler)+", "func handler",
 		"color: red", "const x", "no match",
+		"shellshock", "café", "CAFÉ", "(?-i)café", "caf(?i:É)",
 	}
 	options := []struct {
 		name string
