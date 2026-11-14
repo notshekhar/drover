@@ -242,7 +242,10 @@ func runInstaller(slug, version string, force bool) error {
 		if _, err := exec.LookPath("curl"); err != nil {
 			return fmt.Errorf("curl is required to upgrade and was not found")
 		}
-		cmd = exec.Command("bash", "-c", "curl -fsSL "+installShURL+" | bash")
+		// A connect timeout, because raw.githubusercontent.com shares GitHub's
+		// CDN addresses and one can be unreachable from a given network:
+		// without it curl waits the OS's full 75s on that address first.
+		cmd = exec.Command("bash", "-c", "curl --connect-timeout 10 -fsSL "+installShURL+" | bash")
 	}
 
 	cmd.Env = env

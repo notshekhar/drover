@@ -68,6 +68,15 @@ while [ $# -gt 0 ]; do
   esac
 done
 
+# GitHub serves release files from several CDN addresses, and one of them can
+# be unreachable from a given network (measured 2026-11-14: 185.199.109.133
+# never answered while its three siblings connected in 10ms). With no connect
+# timeout curl waits the OS's full 75s on a dead address before trying the
+# next, once per request. curl gives the first address half this budget, so a
+# dead one now costs ~5s.
+CONNECT_TIMEOUT=10
+fetch() { curl --connect-timeout "$CONNECT_TIMEOUT" "$@"; }
+
 bold() { printf "\033[1m%s\033[0m\n" "$*"; }
 dim()  { printf "\033[2m%s\033[0m\n" "$*"; }
 err()  { printf "\033[31m%s\033[0m\n" "$*" >&2; }
@@ -100,33 +109,47 @@ ver_gt() {
   return 1
 }
 
-# ── Download progress bar ──────────────────────────────────────────────────
-# curl writes a --trace-ascii stream into a FIFO; we parse content-length and
-# `<= recv data` records live and draw a ■■■･･･ 42% bar on stderr. Only used
-# when stderr is a TTY; anything else (or any failure) falls back to plain
-# curl in the caller.
-
-# sed with unbuffered output — GNU (-u), BSD/macOS (-l), else pad each line
-# past the libc buffer so records flush through the pipe as they happen.
-unbuffered_sed() {
-  if echo | sed -u -e "" >/dev/null 2>&1; then
-    sed -nu "$@"
-  elif echo | sed -l -e "" >/dev/null 2>&1; then
-    sed -nl "$@"
-  else
-    local pad="$(printf "\n%512s" "")"
-    sed -ne "s/$/\\${pad}/" "$@"
-  fi
-}
+# ── Download progress bar ─────────────────────────────────────────────────
+# Download in the background and draw a ■■■･･･ 42% bar from how big the output
+# file has grown. Only used when stderr is a TTY; anything else (or any
+# failure) falls back to plain curl in the caller.
+#
+# It used to read curl's --trace-ascii stream instead, which meant curl wrote a
+# hex+ascii transcript of EVERY BYTE of the tarball into a FIFO and bash parsed
+# the ~100MB that came out, one `read` at a time. That turned a 5-second
+# download into 82 (measured, 27MB over a fast link) and left the bar sitting
+# at 0% for the first stretch — indistinguishable from a hang, on the one path
+# every upgrade takes. Polling a file size costs nothing per frame.
+#
+# The total comes from the download's own response headers (curl -D), not a
+# separate HEAD request: each request is another connect, and on a network
+# with a dead CDN address another wait before the bar appears.
 
 PROGRESS_COLOR='\033[38;5;215m'
 PROGRESS_NC='\033[0m'
 
+# Bytes in a file, or empty if it isn't there yet. stat's flags differ by libc.
+file_size() {
+  stat -f%z "$1" 2>/dev/null || stat -c%s "$1" 2>/dev/null || echo ""
+}
+
+# Content-Length of the last response in a curl -D header dump — after
+# redirects, that is the file itself. Empty when the server didn't say.
+header_length() {
+  tr -d '\r' < "$1" 2>/dev/null \
+    | awk 'tolower($1) == "content-length:" {n=$2} END{if (n+0 > 0) print n}'
+}
+
 print_progress() {
   local bytes="$1" length="$2"
-  [ "$length" -gt 0 ] || return 0
-
   local width=50
+
+  if [ "${length:-0}" -le 0 ]; then
+    # No total to divide by: show what has arrived rather than a fake bar.
+    printf "\r${PROGRESS_COLOR}  %s MB${PROGRESS_NC}" "$(( bytes / 1048576 ))" >&4
+    return 0
+  fi
+
   local percent=$(( bytes * 100 / length ))
   [ "$percent" -gt 100 ] && percent=100
   local on=$(( percent * width / 100 ))
@@ -149,53 +172,39 @@ download_with_progress() {
     exec 4>/dev/null
   fi
 
-  local tmp_dir="${TMPDIR:-/tmp}"
-  local tracefile="${tmp_dir}/drover_install_$$.trace"
-
-  rm -f "$tracefile"
-  mkfifo "$tracefile" 2>/dev/null || return 1
-
+  local headers="${output}.headers" donefile="${output}.done"
   # Hide the cursor while the bar redraws; always restore it on the way out.
   printf "\033[?25l" >&4
-  trap "trap - RETURN; rm -f \"$tracefile\"; printf '\033[?25h' >&4; exec 4>&-" RETURN
+  trap "trap - RETURN; rm -f \"$donefile\" \"$headers\"; printf '\033[?25h' >&4; exec 4>&-" RETURN
 
   # -f so an HTTP error fails the download (and the caller's fallback runs)
-  # instead of tracing a 404 page into the output file.
-  (
-    curl -f --trace-ascii "$tracefile" -s -L -o "$output" "$url"
-  ) &
-  local curl_pid=$!
+  # instead of writing a 404 page to the output file. The exit status lands in
+  # a file rather than being polled for: a finished background child is a
+  # zombie until it is waited on, and `kill -0` on a zombie still succeeds, so
+  # watching the pid is a loop that never ends.
+  rm -f "$donefile" "$headers"
+  { fetch -f -s -L -D "$headers" -o "$output" "$url"; echo "$?" > "$donefile"; } &
 
-  unbuffered_sed \
-    -e 'y/ACDEGHLNORTV/acdeghlnortv/' \
-    -e '/^0000: content-length:/p' \
-    -e '/^<= recv data/p' \
-    "$tracefile" | \
-  {
-    local length=0 bytes=0
+  local bytes length=""
+  while [ ! -s "$donefile" ]; do
+    bytes="$(file_size "$output")"
+    # The final response's headers land before its first body byte, so once
+    # bytes arrive the last Content-Length in the dump is the file's.
+    if [ -n "$bytes" ]; then
+      [ -z "$length" ] && length="$(header_length "$headers")"
+      print_progress "$bytes" "${length:-0}"
+    fi
+    sleep 0.1
+  done
 
-    while IFS=" " read -r -a line; do
-      [ "${#line[@]}" -lt 2 ] && continue
-      local tag="${line[0]} ${line[1]}"
-
-      if [ "$tag" = "0000: content-length:" ]; then
-        # Each response in a redirect chain restarts the count; the final
-        # (asset) response's length is the one the bar ends up tracking.
-        length="${line[2]}"
-        length=$(echo "$length" | tr -d '\r')
-        bytes=0
-      elif [ "$tag" = "<= recv" ]; then
-        local size="${line[3]}"
-        bytes=$(( bytes + size ))
-        if [ "$length" -gt 0 ]; then
-          print_progress "$bytes" "$length"
-        fi
-      fi
-    done
-  }
-
-  wait $curl_pid
-  local ret=$?
+  wait
+  local ret
+  ret="$(cat "$donefile" 2>/dev/null || echo 1)"
+  # Land the bar on the real final size rather than wherever the last poll got.
+  if [ "$ret" -eq 0 ]; then
+    bytes="$(file_size "$output")"
+    [ -n "$bytes" ] && print_progress "$bytes" "${length:-$bytes}"
+  fi
   echo "" >&4
   return $ret
 }
@@ -244,13 +253,13 @@ detect_target() {
 # Fall back to the API if redirect parsing fails.
 resolve_latest_tag() {
   local final tag
-  final="$(curl -fsSLI -o /dev/null -w '%{url_effective}' \
+  final="$(fetch -fsSLI -o /dev/null -w '%{url_effective}' \
     "https://github.com/${REPO_SLUG}/releases/latest" 2>/dev/null || true)"
   tag="${final##*/}"
   case "$tag" in
     v[0-9]*) printf "%s" "$tag"; return 0 ;;
   esac
-  curl -fsSL "https://api.github.com/repos/${REPO_SLUG}/releases/latest" 2>/dev/null \
+  fetch -fsSL "https://api.github.com/repos/${REPO_SLUG}/releases/latest" 2>/dev/null \
     | sed -n 's/.*"tag_name"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -n1
 }
 
@@ -382,14 +391,14 @@ do_install() {
   # if the traced download fails for any reason — including HTTP errors,
   # where the retry surfaces curl's own message).
   if ! { [ -t 2 ] && download_with_progress "$url" "$tarball"; }; then
-    if ! curl -fL --progress-bar "$url" -o "$tarball"; then
+    if ! fetch -fL --progress-bar "$url" -o "$tarball"; then
       err "download failed: $url"
       err "  the release may not have a $target asset"
       exit 1
     fi
   fi
 
-  if curl -fsSL "${url}.sha256" -o "$sum" 2>/dev/null && [ -s "$sum" ]; then
+  if fetch -fsSL "${url}.sha256" -o "$sum" 2>/dev/null && [ -s "$sum" ]; then
     local expected got
     expected="$(awk '{print $1}' "$sum")"
     got="$(sha256_of "$tarball")"
